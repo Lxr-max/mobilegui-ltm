@@ -32,3 +32,15 @@ def test_cli_ablate_flag(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "ltm-on" in out
     assert "recovery_after_failure" in out
+
+
+def test_cli_matrix(tmp_path, capsys):
+    report = run_demo(ltm="matrix", k=2, data_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "failures-only" in out
+    assert "shortcuts-only" in out
+    assert "anchors" in out
+    assert "full" in out
+    assert report.report("full").success is True
+    assert report.report("off").success is False
+    assert main(["--matrix", "--k", "2", "--data-dir", str(tmp_path / "cli-matrix")]) == 0

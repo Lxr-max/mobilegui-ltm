@@ -62,7 +62,125 @@ def test_embedding_retriever_callable_and_cosine():
     assert text_ranked[0].content == "beta"
 
 
-def _seed(store):
+def test_retrieve_kind_weights_can_demote_failures(store):
+    _seed(store)
+    store.remember(
+        "neutral ui fact about sneakers cart",
+        kind=MemoryKind.UI_FACT,
+        key="ui:neutral",
+        task_id="shop-red-sneakers-size9",
+        app_ids=["com.example.shopping"],
+    )
+    boosted = store.retrieve(
+        "ShopY size",
+        task_id="shop-red-sneakers-size9",
+        k=8,
+        kind_weights={
+            "failure_note": 4.0,
+            "ui_fact": 0.05,
+            "subgoal_trace": 0.05,
+            "causal_anchor": 0.05,
+            "shortcut": 0.05,
+        },
+    )
+    assert boosted[0].kind is MemoryKind.FAILURE_NOTE
+    demoted = store.retrieve(
+        "ShopY size",
+        task_id="shop-red-sneakers-size9",
+        k=8,
+        kind_weights={
+            "failure_note": 0.01,
+            "ui_fact": 4.0,
+            "subgoal_trace": 0.05,
+            "causal_anchor": 0.05,
+            "shortcut": 0.05,
+        },
+    )
+    assert demoted[0].kind is MemoryKind.UI_FACT
+
+
+def test_retrieve_screen_filter_keeps_unscoped(store):
+    store.remember(
+        "chip on search",
+        key="ui:search-chip",
+        screen="search",
+        app_ids=["com.example.shopping"],
+        task_id="t",
+    )
+    store.remember(
+        "chip on pdp",
+        key="ui:pdp-chip",
+        screen="pdp",
+        app_ids=["com.example.shopping"],
+        task_id="t",
+    )
+    store.remember(
+        "global account state",
+        key="ui:account",
+        app_ids=["com.example.shopping"],
+        task_id="t",
+    )
+    hits = store.retrieve("chip account", screen="search", k=8)
+    screens = {h.screen for h in hits}
+    assert "pdp" not in screens
+    assert any(h.logical_key == "ui:account" for h in hits)
+    assert any(h.logical_key == "ui:search-chip" for h in hits)
+
+
+def test_retrieve_strict_task_filter(store):
+    store.remember("alpha task note", key="ui:a", task_id="alpha")
+    store.remember("beta task note", key="ui:b", task_id="beta")
+    loose = store.retrieve("task note", task_id="alpha", k=8, strict_task=False)
+    assert {h.task_id for h in loose} >= {"alpha", "beta"}
+    strict = store.retrieve("task note", task_id="alpha", k=8, strict_task=True)
+    assert all(h.task_id == "alpha" for h in strict)
+
+
+def test_shortcut_precondition_soft_match(store):
+    matching = MemoryRecord(
+        kind=MemoryKind.SHORTCUT,
+        content="Shortcut: filter then cart",
+        task_id="t",
+        attempt_k=1,
+        agent_id=store.agent_id,
+        metadata={
+            "shortcut": {
+                "name": "filter_cart",
+                "description": "apply size then cart",
+                "preconditions": ["app=com.shop", "start_screen=search"],
+                "arguments": {"size": 9},
+                "atomic_actions": [{"type": "apply_filter", "args": {"size": 9}}],
+                "tags": ["skill"],
+            }
+        },
+    )
+    other = MemoryRecord(
+        kind=MemoryKind.SHORTCUT,
+        content="Shortcut: wifi toggle",
+        task_id="t",
+        attempt_k=1,
+        agent_id=store.agent_id,
+        metadata={
+            "shortcut": {
+                "name": "wifi_on",
+                "description": "toggle wifi",
+                "preconditions": ["app=com.settings", "start_screen=wifi"],
+                "arguments": {},
+                "atomic_actions": [{"type": "tap", "target": "wifi"}],
+                "tags": ["skill"],
+            }
+        },
+    )
+    store.backend.upsert([matching, other])
+    hits = store.retrieve(
+        "apply size filter",
+        task_id="t",
+        k=2,
+        state={"app": "com.shop", "screen": "search"},
+    )
+    assert hits
+    spec_name = hits[0].metadata.get("shortcut", {}).get("name") or hits[0].metadata.get("name")
+    assert spec_name == "filter_cart"
     store.write_attempt(
         "shop-red-sneakers-size9",
         1,

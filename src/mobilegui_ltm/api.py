@@ -10,12 +10,19 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from mobilegui_ltm.encode.traj_summarizer import TrajectorySummarizer
-from mobilegui_ltm.inject import PromptInjector
+from mobilegui_ltm.inject import PromptInjector, format_shortcut_for_worker
 from mobilegui_ltm.plugins import Backend, Embedder, Encoder, Injector, Retriever
+from mobilegui_ltm.profiles import MemoryProfile, resolve_profile
 from mobilegui_ltm.retrieve.embed import EmbeddingRetriever, HybridRetriever
 from mobilegui_ltm.retrieve.embedder import HashingEmbedder, resolve_embedder
 from mobilegui_ltm.retrieve.index import VectorSidecar
 from mobilegui_ltm.retrieve.keyword import BM25Retriever
+from mobilegui_ltm.retrieve.scoring import (
+    active_only,
+    apply_hard_filters,
+    expand_links,
+    normalize_kind_weights,
+)
 from mobilegui_ltm.schema import (
     AttemptOutcome,
     EvalTask,
@@ -23,6 +30,7 @@ from mobilegui_ltm.schema import (
     MemoryKind,
     MemoryRecord,
     OutcomeStatus,
+    RecordStatus,
     SessionBundle,
     Trajectory,
     coerce_outcome,
@@ -60,16 +68,26 @@ class MemoryStore:
         embedder: Embedder | None = None,
         agent_id: str = "default",
         enabled: bool = True,
+        write_kinds: Sequence[MemoryKind] | None = None,
+        retrieve_kinds: Sequence[MemoryKind] | None = None,
+        kind_weights: dict[str, float] | dict[MemoryKind, float] | None = None,
+        expand_hops: int = 0,
+        strict_task: bool = False,
     ) -> None:
         self.backend = backend
         self.encoder = encoder or TrajectorySummarizer()
-        self.retriever = retriever or BM25Retriever()
+        self.retriever = retriever or BM25Retriever(kind_weights=kind_weights)
         self.injector = injector or PromptInjector()
         if embedder is None:
             embedder = getattr(self.retriever, "embedder", None)
         self.embedder = embedder
         self.agent_id = agent_id
         self.enabled = enabled
+        self.write_kinds = tuple(write_kinds) if write_kinds is not None else None
+        self.retrieve_kinds = tuple(retrieve_kinds) if retrieve_kinds is not None else None
+        self.kind_weights = normalize_kind_weights(kind_weights)
+        self.expand_hops = int(expand_hops)
+        self.strict_task = strict_task
 
     # --- core contract -------------------------------------------------
 
@@ -88,16 +106,114 @@ class MemoryStore:
         records = self.encoder.encode(
             task_id, attempt_k, trajectory, result, self.agent_id
         )
-        stamped: list[MemoryRecord] = []
-        for record in records:
-            if record.agent_id != self.agent_id:
-                record = record.model_copy(update={"agent_id": self.agent_id})
-            stamped.append(record)
-        stamped = self._ensure_embeddings(stamped)
-        if stamped:
-            self.backend.upsert(stamped)
+        return self._commit(records)
+
+    def remember(
+        self,
+        content: str,
+        *,
+        kind: MemoryKind | str = MemoryKind.UI_FACT,
+        key: str | None = None,
+        task_id: str = "",
+        attempt_k: int = 0,
+        app_ids: Sequence[str] | None = None,
+        screen: str | None = None,
+        tags: Sequence[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        depends_on: Sequence[str] | None = None,
+        supersede: bool = True,
+    ) -> MemoryRecord | None:
+        """Insert a fact mid-episode. Same ``key`` supersedes the previous active value."""
+        if not self.enabled:
+            return None
+        record = MemoryRecord(
+            kind=MemoryKind(kind),
+            content=content,
+            task_id=task_id,
+            attempt_k=attempt_k,
+            agent_id=self.agent_id,
+            app_ids=list(app_ids or []),
+            tags=list(tags or []),
+            metadata=dict(metadata or {}),
+            logical_key=key,
+            screen=screen,
+            depends_on=list(depends_on or []),
+        )
+        written = self._commit(
+            [record], supersede=supersede, respect_write_kinds=False
+        )
+        return written[0] if written else None
+
+    def update(
+        self,
+        key_or_id: str,
+        *,
+        content: str | None = None,
+        screen: str | None = None,
+        tags: Sequence[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        depends_on: Sequence[str] | None = None,
+    ) -> MemoryRecord | None:
+        """In-place update of an active record (by id or logical key)."""
+        if not self.enabled:
+            return None
+        current = self.get(key_or_id, include_inactive=False)
+        if current is None:
+            return None
+        patch: dict[str, Any] = {}
+        if content is not None:
+            patch["content"] = content
+        if screen is not None:
+            patch["screen"] = screen
+        if tags is not None:
+            patch["tags"] = list(tags)
+        if metadata is not None:
+            merged = dict(current.metadata)
+            merged.update(metadata)
+            patch["metadata"] = merged
+        if depends_on is not None:
+            patch["depends_on"] = list(depends_on)
+        updated = current.model_copy(update=patch)
+        stamped = self._ensure_embeddings([updated], force=True)
+        self.backend.upsert(stamped)
+        self._sync_sidecar()
+        return stamped[0]
+
+    def delete(self, key_or_id: str, *, hard: bool = False) -> int:
+        """Soft-delete (default) or hard-delete a record by id or logical key."""
+        if not self.enabled:
+            return 0
+        current = self.get(key_or_id, include_inactive=True)
+        if current is None:
+            return 0
+        if hard:
+            remover = getattr(self.backend, "remove", None)
+            if callable(remover):
+                n = int(remover([current.id], agent_id=self.agent_id))
+            else:
+                n = 1 if self._soft_delete(current) else 0
             self._sync_sidecar()
-        return stamped
+            return n
+        return 1 if self._soft_delete(current) else 0
+
+    def get(
+        self,
+        key_or_id: str,
+        *,
+        include_inactive: bool = False,
+    ) -> MemoryRecord | None:
+        records = self.backend.list(agent_id=self.agent_id)
+        if not include_inactive:
+            records = active_only(records)
+        by_id = None
+        by_key = None
+        for record in records:
+            if record.id == key_or_id:
+                by_id = record
+                break
+            if record.logical_key == key_or_id and by_key is None:
+                by_key = record
+        return by_id or by_key
 
     def retrieve(
         self,
@@ -107,26 +223,45 @@ class MemoryStore:
         k: int = 5,
         *,
         kinds: Sequence[MemoryKind] | None = None,
+        screen: str | None = None,
+        strict_task: bool | None = None,
+        state: Any = None,
+        kind_weights: dict[str, float] | dict[MemoryKind, float] | None = None,
+        expand_hops: int | None = None,
     ) -> list[MemoryRecord]:
         """Return top-k memories for this namespace (never resets across attempts)."""
         if not self.enabled:
             return []
-        candidates = self.backend.list(agent_id=self.agent_id, kinds=kinds)
-        candidates = self._hydrate_vectors(candidates)
-        missing = [c for c in candidates if self.embedder and not c.embedding]
+        kind_filter = kinds if kinds is not None else self.retrieve_kinds
+        pool = self.backend.list(agent_id=self.agent_id, kinds=kind_filter)
+        pool = active_only(self._hydrate_vectors(pool))
+        missing = [c for c in pool if self.embedder and not c.embedding]
         if missing:
             filled = self._ensure_embeddings(missing, force=True)
             self.backend.upsert(filled)
             by_id = {item.id: item for item in filled}
-            candidates = [by_id.get(c.id, c) for c in candidates]
+            pool = [by_id.get(c.id, c) for c in pool]
             self._sync_sidecar()
-        return self.retriever.retrieve(
+        candidates = apply_hard_filters(
+            pool,
+            app_ids=app_ids,
+            screen=screen,
+            task_id=task_id,
+            strict_task=self.strict_task if strict_task is None else strict_task,
+        )
+        ranked = self.retriever.retrieve(
             candidates,
             query,
             task_id=task_id,
-            app_ids=app_ids,
+            app_ids=None,
             k=k,
+            kind_weights=kind_weights or self.kind_weights,
+            state=state,
         )
+        hops = self.expand_hops if expand_hops is None else expand_hops
+        if hops:
+            ranked = expand_links(ranked, pool, hops=hops)
+        return ranked
 
     def inject(
         self,
@@ -194,6 +329,11 @@ class MemoryStore:
             embedder=self.embedder,
             agent_id=agent_id,
             enabled=self.enabled,
+            write_kinds=self.write_kinds,
+            retrieve_kinds=self.retrieve_kinds,
+            kind_weights=self.kind_weights,
+            expand_hops=self.expand_hops,
+            strict_task=self.strict_task,
         )
 
     def list_memories(
@@ -202,14 +342,93 @@ class MemoryStore:
         task_id: str | None = None,
         app_ids: Sequence[str] | None = None,
         kinds: Sequence[MemoryKind] | None = None,
+        include_inactive: bool = False,
     ) -> list[MemoryRecord]:
         """Unranked listing for this namespace (debugging / tests)."""
-        return self.backend.list(
+        records = self.backend.list(
             agent_id=self.agent_id,
             task_id=task_id,
             app_ids=app_ids,
             kinds=kinds,
         )
+        if include_inactive:
+            return records
+        return active_only(records)
+
+    def format_worker_shortcuts(
+        self,
+        memories: Sequence[MemoryRecord] | None = None,
+    ) -> str:
+        """Callable-style shortcut block for a worker prompt."""
+        records = (
+            list(memories)
+            if memories is not None
+            else self.list_memories(kinds=[MemoryKind.SHORTCUT])
+        )
+        lines = [
+            format_shortcut_for_worker(record)
+            for record in records
+            if record.kind is MemoryKind.SHORTCUT
+        ]
+        return "\n".join(lines)
+
+    def _commit(
+        self,
+        records: Sequence[MemoryRecord],
+        *,
+        supersede: bool = True,
+        respect_write_kinds: bool = True,
+    ) -> list[MemoryRecord]:
+        incoming = list(records)
+        if respect_write_kinds and self.write_kinds is not None:
+            allowed = set(self.write_kinds)
+            incoming = [record for record in incoming if record.kind in allowed]
+        if not incoming:
+            return []
+        incoming = [
+            record.model_copy(update={"agent_id": self.agent_id}) for record in incoming
+        ]
+        incoming = _collapse_logical_keys(incoming)
+        if supersede:
+            self._supersede_existing(incoming)
+        stamped = self._ensure_embeddings(incoming)
+        self.backend.upsert(stamped)
+        self._sync_sidecar()
+        return stamped
+
+    def _supersede_existing(self, incoming: Sequence[MemoryRecord]) -> None:
+        keyed = [record for record in incoming if record.logical_key]
+        if not keyed:
+            return
+        existing = active_only(self.backend.list(agent_id=self.agent_id))
+        incoming_ids = {record.id for record in incoming}
+        demoted: list[MemoryRecord] = []
+        for record in keyed:
+            for old in existing:
+                if old.id in incoming_ids or old.id == record.id:
+                    continue
+                if old.kind is not record.kind:
+                    continue
+                if not old.logical_key or old.logical_key != record.logical_key:
+                    continue
+                demoted.append(
+                    old.model_copy(
+                        update={
+                            "status": RecordStatus.SUPERSEDED,
+                            "superseded_by": record.id,
+                        }
+                    )
+                )
+        if demoted:
+            self.backend.upsert(demoted)
+
+    def _soft_delete(self, record: MemoryRecord) -> bool:
+        if record.status is RecordStatus.DELETED:
+            return False
+        updated = record.model_copy(update={"status": RecordStatus.DELETED})
+        self.backend.upsert([updated])
+        self._sync_sidecar()
+        return True
 
     def rebuild_index(self, *, all_agents: bool = False) -> int:
         """Re-embed persisted memories with the current embedder.
@@ -307,6 +526,12 @@ def create_store(
     embedder: Embedder | str | Callable[[str], list[float]] | None = None,
     lexical_weight: float = 0.5,
     vector_weight: float = 0.5,
+    profile: str | MemoryProfile | None = None,
+    write_kinds: Sequence[MemoryKind] | None = None,
+    retrieve_kinds: Sequence[MemoryKind] | None = None,
+    kind_weights: dict[str, float] | dict[MemoryKind, float] | None = None,
+    expand_hops: int | None = None,
+    strict_task: bool = False,
 ) -> MemoryStore:
     """Factory: JSON-file store under ``path`` (default ``./.mobilegui_ltm``).
 
@@ -317,13 +542,27 @@ def create_store(
         create_store(path, embedder="hashing")       # same as hybrid
         create_store(path, retriever="vector", embedder=FakeEmbedder())
         create_store(path, embedder="sentence-transformers")  # needs [embed]
+        create_store(path, profile="failures-only")  # ablation profile
+        create_store(path, kind_weights={"failure_note": 1.3}, expand_hops=1)
     """
+    resolved_profile = resolve_profile(profile)
+    if resolved_profile is not None:
+        enabled = enabled and resolved_profile.enabled
+        if write_kinds is None:
+            write_kinds = resolved_profile.kinds
+        if retrieve_kinds is None:
+            retrieve_kinds = resolved_profile.kinds
+        if expand_hops is None:
+            expand_hops = resolved_profile.expand_hops
+    hops = 0 if expand_hops is None else int(expand_hops)
+    weights = normalize_kind_weights(kind_weights)
     resolved_embedder = resolve_embedder(embedder)
     resolved_retriever = _resolve_retriever(
         retriever,
         resolved_embedder,
         lexical_weight=lexical_weight,
         vector_weight=vector_weight,
+        kind_weights=weights,
     )
     if resolved_embedder is None:
         resolved_embedder = getattr(resolved_retriever, "embedder", None)
@@ -338,6 +577,11 @@ def create_store(
         embedder=resolved_embedder,
         agent_id=agent_id,
         enabled=enabled,
+        write_kinds=write_kinds,
+        retrieve_kinds=retrieve_kinds,
+        kind_weights=weights,
+        expand_hops=hops,
+        strict_task=strict_task,
     )
 
 
@@ -362,6 +606,7 @@ def _resolve_retriever(
     *,
     lexical_weight: float,
     vector_weight: float,
+    kind_weights: dict[str, float] | None = None,
 ) -> Retriever:
     if retriever is None:
         if embedder is not None:
@@ -369,24 +614,46 @@ def _resolve_retriever(
                 embedder,
                 lexical_weight=lexical_weight,
                 vector_weight=vector_weight,
+                kind_weights=kind_weights,
             )
-        return BM25Retriever()
+        return BM25Retriever(kind_weights=kind_weights)
     if isinstance(retriever, str):
         key = retriever.strip().lower()
         if key in {"bm25", "keyword"}:
-            return BM25Retriever()
+            return BM25Retriever(kind_weights=kind_weights)
         if key == "hybrid":
             return HybridRetriever(
                 embedder or HashingEmbedder(),
                 lexical_weight=lexical_weight,
                 vector_weight=vector_weight,
+                kind_weights=kind_weights,
             )
         if key in {"vector", "embed", "embedding"}:
-            return EmbeddingRetriever(embedder or HashingEmbedder())
+            return EmbeddingRetriever(
+                embedder or HashingEmbedder(),
+                kind_weights=kind_weights,
+            )
         raise ValueError(
             f"Unknown retriever {retriever!r}. Use 'bm25', 'hybrid', or 'vector'."
         )
     return retriever
+
+
+def _collapse_logical_keys(records: Sequence[MemoryRecord]) -> list[MemoryRecord]:
+    """Last write wins for the same (kind, logical_key) inside one commit."""
+    keep: list[MemoryRecord] = []
+    index_for_key: dict[tuple[MemoryKind, str], int] = {}
+    for record in records:
+        if not record.logical_key:
+            keep.append(record)
+            continue
+        key = (record.kind, record.logical_key)
+        if key in index_for_key:
+            keep[index_for_key[key]] = record
+        else:
+            index_for_key[key] = len(keep)
+            keep.append(record)
+    return keep
 
 
 def _load_bundle(session: SessionBundle | dict[str, Any] | str | Path) -> SessionBundle:

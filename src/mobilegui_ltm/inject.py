@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Sequence
 
-from mobilegui_ltm.schema import InjectionTarget, MemoryKind, MemoryRecord
+from mobilegui_ltm.schema import InjectionTarget, MemoryKind, MemoryRecord, ShortcutSpec
 
 LTM_START = "<mobilegui_ltm>"
 LTM_END = "</mobilegui_ltm>"
@@ -19,6 +19,7 @@ _KIND_HEADINGS = {
     MemoryKind.UI_FACT: "UI facts (entities, filters, app state)",
     MemoryKind.SUBGOAL_TRACE: "Subgoal trace (progress / where stuck)",
     MemoryKind.SHORTCUT: "Shortcuts (reusable actions)",
+    MemoryKind.CAUSAL_ANCHOR: "Causal anchors (why / evidence)",
 }
 
 _KIND_ORDER = (
@@ -26,6 +27,7 @@ _KIND_ORDER = (
     MemoryKind.UI_FACT,
     MemoryKind.SUBGOAL_TRACE,
     MemoryKind.SHORTCUT,
+    MemoryKind.CAUSAL_ANCHOR,
 )
 
 
@@ -45,20 +47,45 @@ def format_memories(memories: Sequence[MemoryRecord], *, header: str | None = No
         lines.append(f"### {_KIND_HEADINGS[kind]}")
         for record in bucket:
             apps = f" apps={','.join(record.app_ids)}" if record.app_ids else ""
+            if record.kind is MemoryKind.SHORTCUT:
+                lines.append(format_shortcut_for_worker(record))
+                continue
             lines.append(
                 f"- [{record.kind.value} | task={record.task_id} | "
                 f"attempt={record.attempt_k}{apps}] {record.content}"
             )
-            if record.kind is MemoryKind.SHORTCUT:
-                actions = record.metadata.get("actions") or []
-                pre = record.metadata.get("preconditions") or []
-                if actions and "Actions:" not in record.content:
-                    lines.append("  actions: " + " -> ".join(str(a) for a in actions))
-                if pre and "Preconditions:" not in record.content:
-                    lines.append("  preconditions: " + "; ".join(str(p) for p in pre))
+            if record.kind is MemoryKind.CAUSAL_ANCHOR:
+                evidence = record.metadata.get("evidence") or {}
+                if evidence:
+                    bits = [f"{k}={v}" for k, v in evidence.items() if v]
+                    if bits:
+                        lines.append("  evidence: " + ", ".join(bits))
+                if record.depends_on:
+                    lines.append("  depends_on: " + ", ".join(record.depends_on))
         lines.append("")
     lines.append(LTM_END)
     return "\n".join(lines).strip() + "\n"
+
+
+def format_shortcut_for_worker(record: MemoryRecord) -> str:
+    """Renderable callable-style block for a worker prompt."""
+    spec = ShortcutSpec.from_record(record)
+    if spec is None:
+        return f"- [shortcut] {record.content}"
+    args = ", ".join(f"{k}={v}" for k, v in spec.arguments.items())
+    header = f"call {spec.name}({args})" if args else f"call {spec.name}()"
+    lines = [f"- [shortcut | {header}]"]
+    if spec.description:
+        lines.append(f"  description: {spec.description}")
+    if spec.preconditions:
+        lines.append("  when: " + "; ".join(spec.preconditions))
+    if spec.atomic_actions:
+        lines.append("  steps:")
+        for i, action in enumerate(spec.atomic_actions, start=1):
+            lines.append(f"    {i}. {action.as_text()}")
+    elif record.metadata.get("actions"):
+        lines.append("  steps: " + " -> ".join(str(a) for a in record.metadata["actions"]))
+    return "\n".join(lines)
 
 
 class PromptInjector:

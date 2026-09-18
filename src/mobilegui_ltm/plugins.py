@@ -70,6 +70,9 @@ class Retriever(Protocol):
         task_id: str | None = None,
         app_ids: Sequence[str] | None = None,
         k: int = 5,
+        kind_weights: dict | None = None,
+        state: Any = None,
+        **kwargs: Any,
     ) -> list[MemoryRecord]: ...
 
 

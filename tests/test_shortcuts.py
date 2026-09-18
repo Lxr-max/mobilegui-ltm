@@ -3,7 +3,14 @@ from __future__ import annotations
 from mobilegui_ltm.adapters.dummy import DummyGUIAgent, shopping_task
 from mobilegui_ltm.encode import ShortcutEncoder
 from mobilegui_ltm.inject import LTM_START
-from mobilegui_ltm.schema import AttemptOutcome, MemoryKind, OutcomeStatus, Trajectory
+from mobilegui_ltm.schema import (
+    AttemptOutcome,
+    MemoryKind,
+    MemoryRecord,
+    OutcomeStatus,
+    ShortcutSpec,
+    Trajectory,
+)
 
 
 def _success_traj() -> Trajectory:
@@ -28,6 +35,11 @@ def test_shortcut_encoder_from_success_has_actions_and_preconditions():
     assert episode.metadata["preconditions"]
     assert "com.example.shopping" in episode.app_ids
     assert any("skill" in r.tags for r in recs)
+    spec = ShortcutSpec.from_record(episode)
+    assert spec is not None
+    assert spec.atomic_actions
+    assert spec.arguments
+    assert episode.metadata.get("shortcut")
 
 
 def test_shortcuts_not_mined_on_failure():
@@ -113,3 +125,71 @@ def test_encode_store_retrieve_inject_shortcuts(store):
     blob = prompt.lower()
     assert "apply_filter:size=9" in blob or "add_to_cart" in blob
     assert "preconditions" in blob or "app=" in blob
+    assert "call " in blob
+    spec = next(r for r in stored if "episode" in r.tags)
+    parsed = ShortcutSpec.from_record(spec)
+    assert parsed is not None
+    assert parsed.name
+    assert parsed.atomic_actions
+    assert parsed.preconditions
+    worker = store.format_worker_shortcuts([spec])
+    assert worker.startswith("- [shortcut")
+    assert "call " in worker
+
+
+def test_shortcut_spec_dual_read_legacy_text():
+    rec = MemoryRecord(
+        kind=MemoryKind.SHORTCUT,
+        content="Shortcut: apply size then cart",
+        task_id="t",
+        attempt_k=1,
+        agent_id="a",
+        metadata={
+            "name": "apply_size_cart",
+            "actions": ["apply_filter:size=9", "tap:add_to_cart"],
+            "preconditions": ["app=com.shop", "start_screen=search"],
+        },
+    )
+    spec = ShortcutSpec.from_record(rec)
+    assert spec is not None
+    assert spec.name == "apply_size_cart"
+    assert [a.as_text() for a in spec.atomic_actions] == [
+        "apply_filter:size=9",
+        "tap:add_to_cart",
+    ]
+    assert "app=com.shop" in spec.preconditions
+
+
+def test_explicit_executable_shortcut_dict():
+    traj = Trajectory(
+        steps=_success_traj().steps,
+        app_ids=["com.example.shopping"],
+        metadata={
+            "shortcuts": [
+                {
+                    "name": "open_shopx_pdp",
+                    "description": "Filter size 9 then open ShopX",
+                    "preconditions": ["search results visible"],
+                    "arguments": {"size": 9, "seller": "ShopX"},
+                    "atomic_actions": [
+                        {"type": "apply_filter", "args": {"size": 9}},
+                        {"type": "tap", "target": "ShopX"},
+                    ],
+                    "tags": ["task", "shopping"],
+                    "subgoal": "open target seller",
+                }
+            ]
+        },
+    )
+    recs = ShortcutEncoder().encode(
+        "t",
+        1,
+        traj,
+        AttemptOutcome(status=OutcomeStatus.SUCCESS),
+        "a",
+    )
+    named = next(r for r in recs if r.logical_key == "shortcut:open_shopx_pdp")
+    spec = named.metadata["shortcut"]
+    assert spec["name"] == "open_shopx_pdp"
+    assert spec["atomic_actions"]
+    assert spec["arguments"]["seller"] == "ShopX"

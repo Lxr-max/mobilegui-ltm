@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from mobilegui_ltm.inject import LTM_END, LTM_START, PromptInjector, format_memories
+from mobilegui_ltm.inject import (
+    LTM_END,
+    LTM_START,
+    PromptInjector,
+    format_memories,
+    format_shortcut_for_worker,
+)
 from mobilegui_ltm.schema import InjectionTarget, MemoryKind, MemoryRecord
 
 
@@ -56,3 +62,39 @@ def test_inject_disabled(tmp_path):
     store = create_store(tmp_path, enabled=False)
     recs = [_rec(MemoryKind.UI_FACT, "secret")]
     assert store.inject("x", recs) == "x"
+
+
+def test_format_shortcut_callable_block():
+    rec = MemoryRecord(
+        kind=MemoryKind.SHORTCUT,
+        content="Shortcut: filter then cart",
+        task_id="t",
+        attempt_k=1,
+        agent_id="a",
+        metadata={
+            "shortcut": {
+                "name": "filter_cart",
+                "description": "size then cart",
+                "preconditions": ["app=com.shop"],
+                "arguments": {"size": 9},
+                "atomic_actions": [
+                    {"type": "apply_filter", "args": {"size": 9}},
+                    {"type": "tap", "target": "add_to_cart"},
+                ],
+                "tags": ["skill"],
+            }
+        },
+    )
+    text = format_shortcut_for_worker(rec)
+    assert "call filter_cart(size=9)" in text
+    assert "when: app=com.shop" in text
+    assert "apply_filter:size=9" in text
+    block = format_memories([rec])
+    assert "call filter_cart" in block
+    assert "Causal anchors" not in block
+    anchor = _rec(MemoryKind.CAUSAL_ANCHOR, "moved search -> pdp")
+    anchor.metadata["evidence"] = {"screen": "pdp", "widget": "tap"}
+    anchor.depends_on = ["ui:screens"]
+    with_anchor = format_memories([anchor])
+    assert "Causal anchors" in with_anchor
+    assert "evidence:" in with_anchor

@@ -16,6 +16,10 @@ python examples/pass_at_k_demo/run_demo.py --ltm ablate --k 2
 # or
 mobilegui-ltm-demo --ablate --k 2
 
+# kind-profile matrix (off / failures-only / shortcuts-only / anchors / full)
+mobilegui-ltm-demo --matrix --k 2
+python examples/pass_at_k_demo/run_demo.py --ltm matrix --k 2
+
 # optional: same demo with local hashing hybrid retrieval (no downloads)
 mobilegui-ltm-demo --ltm on --retriever hybrid --k 2
 ```

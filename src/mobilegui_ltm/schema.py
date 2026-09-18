@@ -1,7 +1,7 @@
 """Structured memory schema for mobile GUI long-term memory.
 
 Memory kinds are GUI-specific (UI facts, subgoal traces, failure notes,
-and phase-2 shortcuts). This is not a generic chat-memory log.
+shortcuts, causal anchors). This is not a generic chat-memory log.
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ class MemoryKind(str, Enum):
     SUBGOAL_TRACE = "subgoal_trace"
     FAILURE_NOTE = "failure_note"
     SHORTCUT = "shortcut"
+    CAUSAL_ANCHOR = "causal_anchor"
+
+
+class RecordStatus(str, Enum):
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    DELETED = "deleted"
 
 
 class OutcomeStatus(str, Enum):
@@ -56,11 +63,11 @@ class Trajectory(BaseModel):
 
     Extra structured hints may be placed in ``metadata``:
 
-    - ``ui_facts``: list[str]
+    - ``ui_facts``: list[str] | list[{key, content, screen}]
     - ``subgoals``: list[str]
     - ``failure_notes``: list[str]
-    - ``shortcuts``: list[str] | list[dict] (explicit reusable action snippets)
-    - ``preconditions``: list[str] (hinted shortcut preconditions)
+    - ``shortcuts``: list[str] | list[dict] (executable snippets)
+    - ``preconditions``: list[str]
     - ``apps`` / ``app_ids``: list[str]
     """
 
@@ -78,6 +85,73 @@ class AttemptOutcome(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class Evidence(BaseModel):
+    """Where a causal anchor was observed (no graph DB — just pointers)."""
+
+    app_id: str | None = None
+    screen: str | None = None
+    widget: str | None = None
+
+
+class AtomicAction(BaseModel):
+    """One executable GUI step inside a shortcut."""
+
+    type: str
+    target: str | None = None
+    args: dict[str, Any] = Field(default_factory=dict)
+    app_id: str | None = None
+    screen: str | None = None
+    description: str | None = None
+
+    def as_text(self) -> str:
+        extra = ",".join(f"{k}={v}" for k, v in self.args.items()) if self.args else ""
+        if self.target and extra and extra not in self.target:
+            return f"{self.type}:{self.target}({extra})"
+        if self.target:
+            return f"{self.type}:{self.target}"
+        if extra:
+            return f"{self.type}:{extra}"
+        return self.type
+
+
+class ShortcutSpec(BaseModel):
+    """Executable shortcut (skill-style, SDK-side only)."""
+
+    name: str
+    description: str = ""
+    preconditions: list[str] = Field(default_factory=list)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    atomic_actions: list[AtomicAction] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    app_ids: list[str] = Field(default_factory=list)
+    subgoal: str | None = None
+
+    def action_texts(self) -> list[str]:
+        return [step.as_text() for step in self.atomic_actions]
+
+    @classmethod
+    def from_record(cls, record: "MemoryRecord") -> ShortcutSpec | None:
+        """Dual-read structured specs and older text-only shortcut metadata."""
+        if record.kind is not MemoryKind.SHORTCUT:
+            return None
+        meta = record.metadata or {}
+        raw = meta.get("shortcut")
+        if isinstance(raw, dict):
+            return cls.model_validate(raw)
+        actions = _atomic_from_legacy(meta)
+        name = meta.get("name") or _name_from_content(record.content)
+        return cls(
+            name=str(name),
+            description=meta.get("description") or record.content.split("\n", 1)[0],
+            preconditions=_as_str_list(meta.get("preconditions")),
+            arguments=dict(meta.get("arguments") or {}),
+            atomic_actions=actions,
+            tags=list(record.tags),
+            app_ids=list(record.app_ids),
+            subgoal=meta.get("subgoal"),
+        )
+
+
 class MemoryRecord(BaseModel):
     """One persisted memory item."""
 
@@ -92,22 +166,42 @@ class MemoryRecord(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict[str, Any] = Field(default_factory=dict)
     embedding: list[float] | None = None
+    logical_key: str | None = None
+    status: RecordStatus = RecordStatus.ACTIVE
+    superseded_by: str | None = None
+    screen: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+
+    def is_active(self) -> bool:
+        return self.status is RecordStatus.ACTIVE
 
     def searchable_text(self) -> str:
         apps = " ".join(self.app_ids)
         tags = " ".join(self.tags)
-        extra = ""
+        extra_bits: list[str] = []
+        if self.logical_key:
+            extra_bits.append(self.logical_key)
+        if self.screen:
+            extra_bits.append(self.screen)
+        extra_bits.extend(self.depends_on)
         if self.kind is MemoryKind.SHORTCUT:
-            bits: list[str] = []
-            for key in ("actions", "preconditions", "screens"):
-                value = self.metadata.get(key)
-                if isinstance(value, list):
-                    bits.extend(str(item) for item in value)
-                elif value:
-                    bits.append(str(value))
-            if self.metadata.get("subgoal"):
-                bits.append(str(self.metadata["subgoal"]))
-            extra = " ".join(bits)
+            spec = ShortcutSpec.from_record(self)
+            if spec:
+                extra_bits.extend(
+                    [
+                        spec.name,
+                        spec.description,
+                        " ".join(spec.preconditions),
+                        " ".join(spec.action_texts()),
+                        " ".join(f"{k} {v}" for k, v in spec.arguments.items()),
+                        spec.subgoal or "",
+                    ]
+                )
+        if self.kind is MemoryKind.CAUSAL_ANCHOR:
+            evidence = self.metadata.get("evidence") or {}
+            if isinstance(evidence, dict):
+                extra_bits.extend(str(v) for v in evidence.values() if v)
+        extra = " ".join(part for part in extra_bits if part)
         return " ".join(
             part
             for part in (
@@ -143,6 +237,75 @@ class EvalTask(BaseModel):
 
     def retrieval_query(self) -> str:
         return self.query or self.instruction
+
+
+def parse_atomic_action(
+    action: Any,
+    *,
+    app_id: str | None = None,
+    screen: str | None = None,
+) -> AtomicAction:
+    """Parse a trajectory action (string or dict) into an AtomicAction."""
+    if isinstance(action, AtomicAction):
+        return action
+    if isinstance(action, dict):
+        data = dict(action)
+        data.setdefault("app_id", app_id)
+        data.setdefault("screen", screen)
+        if "type" not in data:
+            data["type"] = str(data.get("action") or data.get("name") or "unknown")
+        return AtomicAction.model_validate(data)
+    text = "" if action is None else str(action).strip()
+    if not text:
+        return AtomicAction(type="unknown", app_id=app_id, screen=screen)
+    if ":" in text:
+        typ, rest = text.split(":", 1)
+        args: dict[str, Any] = {}
+        target = rest.strip() or None
+        if "=" in rest and "(" not in rest:
+            key, value = rest.split("=", 1)
+            if "," not in key and ":" not in key:
+                args[key.strip()] = value.strip()
+                target = None
+        return AtomicAction(
+            type=typ.strip() or "unknown",
+            target=target,
+            args=args,
+            app_id=app_id,
+            screen=screen,
+        )
+    return AtomicAction(type=text, app_id=app_id, screen=screen)
+
+
+def _atomic_from_legacy(meta: dict[str, Any]) -> list[AtomicAction]:
+    raw_atomic = meta.get("atomic_actions")
+    if isinstance(raw_atomic, list) and raw_atomic:
+        out: list[AtomicAction] = []
+        for item in raw_atomic:
+            if isinstance(item, AtomicAction):
+                out.append(item)
+            elif isinstance(item, dict):
+                out.append(AtomicAction.model_validate(item))
+            else:
+                out.append(parse_atomic_action(item))
+        return out
+    return [parse_atomic_action(item) for item in _as_str_list(meta.get("actions"))]
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)]
+
+
+def _name_from_content(content: str) -> str:
+    line = (content or "shortcut").split("\n", 1)[0]
+    line = line.replace("Shortcut:", "").strip()
+    return line[:48] or "shortcut"
 
 
 def coerce_trajectory(traj: Trajectory | dict[str, Any] | list[Any] | str | None) -> Trajectory:

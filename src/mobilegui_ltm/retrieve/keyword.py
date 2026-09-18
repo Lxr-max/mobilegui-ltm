@@ -7,23 +7,21 @@ boost; ``app_ids`` on the query restrict to overlapping (or unscoped) records.
 from __future__ import annotations
 
 import math
-import re
 from collections import Counter
 from typing import Sequence
 
-from mobilegui_ltm.schema import MemoryKind, MemoryRecord
-
-_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+from mobilegui_ltm.schema import MemoryRecord
+from mobilegui_ltm.retrieve.scoring import (
+    kind_weight,
+    normalize_kind_weights,
+    precondition_bonus,
+    tokenize,
+)
 
 # Tuned for short memory notes rather than long documents.
 _K1 = 1.4
 _B = 0.5
 _TASK_BOOST = 1.35
-_FAILURE_BOOST = 1.15
-
-
-def tokenize(text: str) -> list[str]:
-    return [tok.lower() for tok in _TOKEN.findall(text or "")]
 
 
 class BM25Retriever:
@@ -35,10 +33,12 @@ class BM25Retriever:
         k1: float = _K1,
         b: float = _B,
         task_boost: float = _TASK_BOOST,
+        kind_weights: dict | None = None,
     ) -> None:
         self.k1 = k1
         self.b = b
         self.task_boost = task_boost
+        self.kind_weights = normalize_kind_weights(kind_weights)
 
     def retrieve(
         self,
@@ -48,6 +48,9 @@ class BM25Retriever:
         task_id: str | None = None,
         app_ids: Sequence[str] | None = None,
         k: int = 5,
+        kind_weights: dict | None = None,
+        state: object = None,
+        **_kwargs: object,
     ) -> list[MemoryRecord]:
         candidates = _filter_apps(list(records), app_ids)
         if not candidates:
@@ -66,7 +69,14 @@ class BM25Retriever:
                 ),
             )[:k]
 
-        scores = self._score(candidates, query_tokens, task_id=task_id)
+        scores = self._score(
+            candidates,
+            query_tokens,
+            task_id=task_id,
+            query=query,
+            state=state,
+            kind_weights=kind_weights,
+        )
         ranked = sorted(
             zip(scores, candidates, strict=True),
             key=lambda pair: pair[0],
@@ -82,6 +92,9 @@ class BM25Retriever:
         query: str,
         *,
         task_id: str | None = None,
+        state: object = None,
+        kind_weights: dict | None = None,
+        apply_bonuses: bool = True,
     ) -> list[float]:
         """Raw BM25 scores aligned with ``records`` (no app filter)."""
         if not records:
@@ -89,7 +102,15 @@ class BM25Retriever:
         query_tokens = tokenize(query)
         if not query_tokens:
             return [0.0] * len(records)
-        return self._score(records, query_tokens, task_id=task_id)
+        return self._score(
+            records,
+            query_tokens,
+            task_id=task_id,
+            query=query,
+            state=state,
+            kind_weights=kind_weights,
+            apply_bonuses=apply_bonuses,
+        )
 
     def _score(
         self,
@@ -97,6 +118,10 @@ class BM25Retriever:
         query_tokens: list[str],
         *,
         task_id: str | None,
+        query: str = "",
+        state: object = None,
+        kind_weights: dict | None = None,
+        apply_bonuses: bool = True,
     ) -> list[float]:
         docs = [tokenize(r.searchable_text()) for r in records]
         lengths = [max(len(doc), 1) for doc in docs]
@@ -123,8 +148,10 @@ class BM25Retriever:
                 score += idf.get(term, 0.0) * (freq * (self.k1 + 1.0) / denom) * qtf
             if task_id and record.task_id == task_id:
                 score *= self.task_boost
-            if record.kind == MemoryKind.FAILURE_NOTE:
-                score *= _FAILURE_BOOST
+            if apply_bonuses:
+                weights = normalize_kind_weights(kind_weights or self.kind_weights)
+                score *= kind_weight(record, weights)
+                score *= precondition_bonus(record, query, state)
             scores.append(score)
         return scores
 

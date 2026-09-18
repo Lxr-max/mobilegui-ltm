@@ -95,6 +95,14 @@ class JsonFileBackend:
         sidecar.unlink(missing_ok=True)
         return len(records)
 
+    def remove(self, ids: Sequence[str], *, agent_id: str) -> int:
+        """Hard-delete records by id in one namespace."""
+        existing = self._read(agent_id)
+        drop = set(ids)
+        keep = [record for record in existing if record.id not in drop]
+        self._write(agent_id, keep)
+        return len(existing) - len(keep)
+
     def replace_all(self, records: Sequence[MemoryRecord]) -> None:
         self.delete()
         if records:
