@@ -181,6 +181,9 @@ def test_shortcut_precondition_soft_match(store):
     assert hits
     spec_name = hits[0].metadata.get("shortcut", {}).get("name") or hits[0].metadata.get("name")
     assert spec_name == "filter_cart"
+
+
+def _seed(store):
     store.write_attempt(
         "shop-red-sneakers-size9",
         1,

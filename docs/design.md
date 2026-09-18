@@ -184,7 +184,8 @@ python examples/pass_at_k_demo/run_demo.py --ltm matrix --k 2
 
 Metrics in the table: `pass@1`, `pass@k`, `recovery_after_failure`,
 `solved_at`. On the dummy shopping task, **full** recovers and **off** does
-not; **failures-only** recovers; **shortcuts-only** does not (attempt 1 is a
+not; **failures-only** recovers; **anchors** recover because failure evidence
+is copied into the anchor; **shortcuts-only** does not (attempt 1 is a
 failure, so no shortcut is stored).
 
 ## Encoder / retriever / injector

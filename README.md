@@ -138,7 +138,7 @@ ltm-on   | 0.0    | 1.0    | 1.0                    | 2
 
 Attempt 1 fails in both arms (first search hit is the wrong seller). With LTM on, attempt 2 retrieves failure notes and applies a size filter at ShopX. With LTM off, attempt 2 repeats attempt 1.
 
-On the dummy shopping task, **failures-only** recovers (the agent keys off injected failure notes). **shortcuts-only** does not: attempt 1 is a failure, so no executable shortcut is mined. **full** beats **off** on `pass@k` and `recovery_after_failure`.
+On the dummy shopping task, **failures-only** recovers (the agent keys off injected failure notes). **shortcuts-only** does not: attempt 1 is a failure, so no executable shortcut is mined. **anchors** recovers because the failure-point anchor copies the outcome reason (including avoidance text). **full** beats **off** on `pass@k` and `recovery_after_failure`.
 
 ```python
 from mobilegui_ltm import create_store

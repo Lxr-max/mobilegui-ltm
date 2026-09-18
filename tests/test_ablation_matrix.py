@@ -48,6 +48,8 @@ def test_each_matrix_mode_runs_and_full_beats_off(tmp_path):
 
     anchors = matrix.report("anchors")
     assert len(anchors.attempts) == 2
+    assert anchors.success is True
+    assert anchors.recovered_after_failure is True
 
 
 def test_failures_only_profile_writes_only_failure_notes(tmp_path):
