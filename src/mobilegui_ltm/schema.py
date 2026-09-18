@@ -23,7 +23,7 @@ class MemoryKind(str, Enum):
     UI_FACT = "ui_fact"
     SUBGOAL_TRACE = "subgoal_trace"
     FAILURE_NOTE = "failure_note"
-    SHORTCUT = "shortcut"  # phase 2 — encoder stub only in MVP
+    SHORTCUT = "shortcut"
 
 
 class OutcomeStatus(str, Enum):
@@ -59,6 +59,8 @@ class Trajectory(BaseModel):
     - ``ui_facts``: list[str]
     - ``subgoals``: list[str]
     - ``failure_notes``: list[str]
+    - ``shortcuts``: list[str] | list[dict] (explicit reusable action snippets)
+    - ``preconditions``: list[str] (hinted shortcut preconditions)
     - ``apps`` / ``app_ids``: list[str]
     """
 
@@ -94,6 +96,18 @@ class MemoryRecord(BaseModel):
     def searchable_text(self) -> str:
         apps = " ".join(self.app_ids)
         tags = " ".join(self.tags)
+        extra = ""
+        if self.kind is MemoryKind.SHORTCUT:
+            bits: list[str] = []
+            for key in ("actions", "preconditions", "screens"):
+                value = self.metadata.get(key)
+                if isinstance(value, list):
+                    bits.extend(str(item) for item in value)
+                elif value:
+                    bits.append(str(value))
+            if self.metadata.get("subgoal"):
+                bits.append(str(self.metadata["subgoal"]))
+            extra = " ".join(bits)
         return " ".join(
             part
             for part in (
@@ -102,6 +116,7 @@ class MemoryRecord(BaseModel):
                 self.task_id,
                 apps,
                 tags,
+                extra,
             )
             if part
         )

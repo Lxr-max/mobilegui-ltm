@@ -1,4 +1,4 @@
-"""Plugin protocols: Backend, Encoder, Retriever, Injector.
+"""Plugin protocols: Backend, Encoder, Retriever, Injector (plus optional Embedder).
 
 Swap any of these without forking the agent. See ``docs/design.md``.
 """
@@ -14,6 +14,17 @@ from mobilegui_ltm.schema import (
     MemoryRecord,
     Trajectory,
 )
+
+
+class Embedder(Protocol):
+    """Optional vector encoder used by hybrid / vector retrievers."""
+
+    dim: int
+    name: str
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
 
 
 class Backend(Protocol):

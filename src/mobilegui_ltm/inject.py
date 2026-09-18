@@ -49,6 +49,13 @@ def format_memories(memories: Sequence[MemoryRecord], *, header: str | None = No
                 f"- [{record.kind.value} | task={record.task_id} | "
                 f"attempt={record.attempt_k}{apps}] {record.content}"
             )
+            if record.kind is MemoryKind.SHORTCUT:
+                actions = record.metadata.get("actions") or []
+                pre = record.metadata.get("preconditions") or []
+                if actions and "Actions:" not in record.content:
+                    lines.append("  actions: " + " -> ".join(str(a) for a in actions))
+                if pre and "Preconditions:" not in record.content:
+                    lines.append("  preconditions: " + "; ".join(str(p) for p in pre))
         lines.append("")
     lines.append(LTM_END)
     return "\n".join(lines).strip() + "\n"

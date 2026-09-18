@@ -9,7 +9,7 @@ attempt k  →  write_attempt(task, k, traj, outcome)
 attempt k+1 → retrieve(query) → inject(prompt, memories) → act
 ```
 
-Write **successes and failures**. Retrieve UI facts, subgoal traces, and failure notes. Inject them into system / planner / worker prompts. Swap the JSON backend, encoder, retriever, or injector without forking the agent.
+Write **successes and failures**. Retrieve UI facts, subgoal traces, failure notes, and **shortcuts** (reusable action snippets from successful attempts). Inject them into system / planner / worker prompts. Swap the JSON backend, encoder, retriever, or injector without forking the agent.
 
 ## Install
 
@@ -21,6 +21,8 @@ cd mobilegui-ltm
 pip install -e .
 # optional: tests
 pip install -e ".[dev]"
+# optional: neural embeddings (not required; downloads model weights)
+pip install -e ".[embed]"
 ```
 
 ## Quickstart
@@ -98,9 +100,12 @@ Citation-style comparison (success rate / recovery after failure) on a dummy sho
 # both arms, ASCII table
 mobilegui-ltm-demo --ablate --k 2
 
-# single arm
+# single arm (BM25 default — same as CI demo)
 mobilegui-ltm-demo --ltm on  --k 2 --data-dir ./demo_store
 mobilegui-ltm-demo --ltm off --k 2 --data-dir ./demo_store
+
+# optional: hybrid ranking with local hashing vectors (no downloads)
+mobilegui-ltm-demo --ltm on --retriever hybrid --k 2
 ```
 
 Equivalent from a checkout:
@@ -122,36 +127,79 @@ Attempt 1 fails in both arms (first search hit is the wrong seller). With LTM on
 
 ## Memory kinds
 
-| Kind | Role | MVP |
-| --- | --- | --- |
-| **UI facts** | Cross-step / cross-app entities (shops, filters, account-looking state) | yes |
-| **Subgoal trace** | How far along, where stuck | yes |
-| **Failure notes** | Failure mode + next-time avoidance (feeds recovery metrics) | yes |
-| **Shortcuts** | Reusable action snippets | phase 2 stub (`ShortcutEncoder` returns `[]`) |
+| Kind | Role |
+| --- | --- |
+| **UI facts** | Cross-step / cross-app entities (shops, filters, account-looking state) |
+| **Subgoal trace** | How far along, where stuck |
+| **Failure notes** | Failure mode + next-time avoidance (feeds recovery metrics) |
+| **Shortcuts** | Reusable action sequences mined from **successful** (or clean high-progress partial) trajectories: task/app/subgoal tags, action list, optional preconditions |
 
-Schema is structured JSON (`MemoryRecord`). Optional `embedding` field is reserved; the default retriever is BM25. **No graph database** in the MVP.
+Successful `write_attempt` calls persist an episode-level shortcut plus small skill windows (filter / cart / search / …). Failures do not become shortcuts. Disable with `TrajectorySummarizer(emit_shortcuts=False)`.
+
+Schema is structured JSON (`MemoryRecord`). Vectors live on `MemoryRecord.embedding` and in an optional `{agent}.vectors.json` sidecar. Default retriever is BM25. **No graph database**.
+
+## Vector / hybrid retrieval
+
+Default ranking is BM25 (offline, no extra deps). Enable vectors with a pluggable **Embedder**:
+
+| Embedder | When to use | Extra |
+| --- | --- | --- |
+| `HashingEmbedder` (`embedder="hashing"`) | Default local backend: signed hashing trick, deterministic, no downloads | none |
+| `FakeEmbedder` | Unit tests / CI fixture vectors | none |
+| `SentenceTransformerEmbedder` (`embedder="sentence-transformers"`) | Neural embeddings | `pip install 'mobilegui-ltm[embed]'` |
+
+```python
+from mobilegui_ltm import create_store, FakeEmbedder, HashingEmbedder
+
+# BM25 + hashing vectors (recommended local hybrid)
+store = create_store("./.mobilegui_ltm", retriever="hybrid")
+# equivalent:
+store = create_store("./.mobilegui_ltm", embedder="hashing")
+
+# Vector-only
+store = create_store("./.mobilegui_ltm", retriever="vector", embedder=HashingEmbedder(dim=128))
+
+# Tests / CI: no network, no weights
+store = create_store("./.mobilegui_ltm", retriever="hybrid", embedder=FakeEmbedder())
+
+# Optional neural backend (downloads weights; not used in CI)
+store = create_store("./.mobilegui_ltm", embedder="sentence-transformers")
+```
+
+Fusion is `lexical_weight * BM25 + vector_weight * cosine` (defaults 0.5 / 0.5). Tune with `create_store(..., lexical_weight=0.3, vector_weight=0.7)`.
+
+Embeddings are written on `write_attempt` and stored in the JSON memory file. A sidecar `{root}/{agent}.vectors.json` records `embedder` name, `dim`, and `{id: vector}` for inspection. After changing embedders, rebuild:
+
+```python
+store = create_store("./.mobilegui_ltm", retriever="hybrid")
+n = store.rebuild_index()  # re-embed all records in this namespace
+```
+
+`export_session` / `import_session` carry `embedding` fields. If you import into a hybrid store and vectors are missing, they are stamped with the current embedder.
 
 ## Plugin points
 
 Swap these without forking the agent:
 
-1. **Backend** — JSON files (default) → SQLite stub → vector DB later  
-2. **Encoder** — trajectory → tips / UI facts / failure notes (`TrajectorySummarizer`)  
-3. **Retriever** — task / app filters + BM25; `EmbeddingRetriever` is an optional stub  
-4. **Injector** — which segment: `system` / `planner` / `worker`
+1. **Backend** — JSON files (default) → SQLite stub  
+2. **Encoder** — trajectory → UI facts / subgoals / failure notes / shortcuts  
+3. **Retriever** — BM25, hybrid, or vector (`HybridRetriever` / `EmbeddingRetriever`)  
+4. **Injector** — which segment: `system` / `planner` / `worker`  
+5. **Embedder** (optional) — hashing / fake / sentence-transformers
 
 ```python
-from mobilegui_ltm import MemoryStore
+from mobilegui_ltm import MemoryStore, HashingEmbedder
 from mobilegui_ltm.store import JsonFileBackend
 from mobilegui_ltm.encode import TrajectorySummarizer
-from mobilegui_ltm.retrieve import BM25Retriever
+from mobilegui_ltm.retrieve import HybridRetriever
 from mobilegui_ltm.inject import PromptInjector
 
 store = MemoryStore(
     backend=JsonFileBackend("./.mobilegui_ltm"),
     encoder=TrajectorySummarizer(),
-    retriever=BM25Retriever(),
+    retriever=HybridRetriever(HashingEmbedder(), lexical_weight=0.5, vector_weight=0.5),
     injector=PromptInjector(placement="prepend"),
+    embedder=HashingEmbedder(),
     agent_id="agent-a",
 )
 worker_view = store.namespace("worker-B")  # isolated namespace, same files root
@@ -173,25 +221,25 @@ pip install -e ".[dev]"
 pytest
 ```
 
-All tests are offline.
+All tests are offline (FakeEmbedder / hashing; no model downloads).
 
 ## Package layout
 
 ```text
 src/mobilegui_ltm/
-  api.py schema.py inject.py cli.py
-  store/{json,sqlite}.py          # sqlite is a phase-2 stub
-  encode/traj_summarizer.py
-  retrieve/{keyword,embed}.py     # embed is an optional stub
+  api.py schema.py inject.py cli.py plugins.py
+  store/{json,sqlite}.py
+  encode/{traj_summarizer,shortcuts}.py
+  retrieve/{keyword,embed,embedder,index}.py
   adapters/{pass_at_k,android_world,agent_s2,dummy}.py
 examples/pass_at_k_demo/
 tests/
 docs/design.md
 ```
 
-## Phase 2
+## Later work
 
-Extension points only (not in this MVP): vector retrieval with a real encoder, shortcut mining, integrity / poisoning hooks (CoMemOffset-style signing), and thicker env adapters.
+Integrity / poisoning hooks (CoMemOffset-style signing) and thicker env adapters.
 
 ## Citation
 
