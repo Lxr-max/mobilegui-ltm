@@ -119,6 +119,11 @@ mobilegui-ltm-demo --ltm failures-only --k 2
 
 # optional: hybrid ranking with local hashing vectors (no downloads)
 mobilegui-ltm-demo --ltm on --retriever hybrid --k 2
+
+# online diagnostics (dry-run promote/demote/quarantine; no LLM)
+mobilegui-ltm-demo --diagnose --k 2
+# optional: apply conservative actions (still skips reflector rewrites)
+mobilegui-ltm-demo --diagnose --apply-diagnostics --k 2
 ```
 
 Equivalent from a checkout:
@@ -290,6 +295,42 @@ assert store.retrieve("ShopY", k=5) == []         # dropped
 
 `store.poison` / `tamper(record)` are fixtures for eval harnesses.
 
+## OnlineDiagnostics (optional)
+
+SDK-only runtime scoring of **memory usefulness** after each episode. No LLM and no API keys in the default path. Enable with `create_store(..., diagnostics=True)` or pass an `OnlineDiagnostics` instance (optional `EpisodeReflector` / `OutcomeProvider` plugins).
+
+After `write_attempt` (and therefore after each `PassAtKRunner` attempt), the store builds an `EpisodeTrace` and returns a `DiagnosticReport`:
+
+| Signal | Meaning |
+| --- | --- |
+| **Attribution** | Retrieved rows scored `helped` / `hurt` / `unused`. A success whose retrieved shortcut aligns with the trajectory counts as helped; a failure after injecting a shortcut counts as hurt. |
+| **Failure class** | Heuristic from `outcome.reason` / trajectory: `state_loss`, `misbinding`, `context_drift`, `unverified_progress`, `interruption`, `unknown`. |
+| **Recovery delta** | Previous attempt failed and this one succeeded — extra promote signal for retrieved shortcuts/anchors. |
+| **Auditor** | `EvalAuditor.scan(store)` flags polarity contradictions, integrity mismatches, and stale candidates, then **proposes quarantine**. |
+
+**Auto vs human-in-the-loop**
+
+| Action | Default |
+| --- | --- |
+| Propose promote / demote / quarantine | automatic (report.actions) |
+| Apply those proposals | **dry-run** unless `apply(dry_run=False)` or CLI `--apply-diagnostics` |
+| Tip / shortcut rewrites from `EpisodeReflector` | plugin only (`NullEpisodeReflector` by default); **not applied** unless `apply(..., include_reflector=True)` |
+| Hard-delete on quarantine | never — metadata flag only; retrieve skips quarantined rows unless `include_quarantined=True` |
+
+```python
+from mobilegui_ltm import create_store, OnlineDiagnostics, NullEpisodeReflector
+
+store = create_store("./.mobilegui_ltm", diagnostics=True)
+# … pass@k loop …
+print(store.diagnostics.format_history())          # ASCII summary
+store.diagnostics.apply(dry_run=True)              # preview
+store.quarantine("ui:bad-tip", reason="contradiction")
+hits = store.retrieve("ShopY", include_quarantined=False)  # default: hidden
+```
+
+`OutcomeProvider` is a stub for a later AndroidWorld-style verifier (`NullOutcomeProvider` / `CallableOutcomeProvider`). Bind an LLM reflector later if you want rewrite proposals; tests and CI stay offline.
+
+## Plugin points
 Embeddings are written on `write_attempt` and stored in the JSON memory file. A sidecar `{root}/{agent}.vectors.json` records `embedder` name, `dim`, and `{id: vector}` for inspection. After changing embedders, rebuild:
 
 ```python
@@ -310,6 +351,8 @@ Swap these without forking the agent:
 5. **Embedder** (optional) — hashing / fake / sentence-transformers  
 6. **LocalRAG** (optional, default off) — installed-app catalog priors  
 7. **IntegrityGuard** (optional, default off) — hash / HMAC research hooks
+8. **OnlineDiagnostics** (optional, default off) — episode attribution + conservative actions
+9. **EpisodeReflector / OutcomeProvider** (optional) — rewrite / verifier plugins; Null by default
 
 ```python
 from mobilegui_ltm import MemoryStore, HashingEmbedder
@@ -353,6 +396,7 @@ All tests are offline (FakeEmbedder / hashing; no model downloads).
 src/mobilegui_ltm/
   api.py schema.py inject.py cli.py plugins.py profiles.py
   blocks.py localrag.py integrity.py
+  diagnostics/{schema,online,attribution,failure_taxonomy,outcome,auditor,reflector}.py
   store/{json,sqlite}.py
   encode/{traj_summarizer,shortcuts,anchors}.py
   retrieve/{keyword,embed,embedder,index,scoring}.py
@@ -364,7 +408,7 @@ docs/design.md
 
 ## Later work
 
-Thicker env adapters and optional SQLite / external vector DB backends.
+Thicker env adapters, optional SQLite / external vector DB backends, and a real LLM client behind `EpisodeReflector` (still a plugin — not the default).
 
 ## Citation
 

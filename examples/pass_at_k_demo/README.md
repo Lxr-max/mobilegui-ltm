@@ -22,6 +22,10 @@ python examples/pass_at_k_demo/run_demo.py --ltm matrix --k 2
 
 # optional: same demo with local hashing hybrid retrieval (no downloads)
 mobilegui-ltm-demo --ltm on --retriever hybrid --k 2
+
+# online diagnostics (attribution / promote-demote / auditor, dry-run)
+mobilegui-ltm-demo --diagnose --k 2
+python examples/pass_at_k_demo/run_demo.py --diagnose --k 2
 ```
 
 The JSON store is written under `--data-dir` (default `./demo_store`).

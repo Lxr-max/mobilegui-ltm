@@ -4,7 +4,7 @@ import mobilegui_ltm as m
 
 
 def test_public_exports():
-    assert m.__version__ == "0.4.0"
+    assert m.__version__ == "0.5.0"
     assert m.create_store.__doc__
     assert m.MemoryStore is not None
     assert m.MemoryKind.UI_FACT.value == "ui_fact"
@@ -37,3 +37,11 @@ def test_public_exports():
     assert callable(m.MemoryStore.inject_block)
     assert callable(m.MemoryStore.register_app_prior)
     assert callable(m.MemoryStore.poison)
+    assert callable(m.MemoryStore.quarantine)
+    assert callable(m.MemoryStore.unquarantine)
+    assert m.OnlineDiagnostics is not None
+    assert m.FailureClass.MISBINDING.value == "misbinding"
+    assert m.Attribution.HELPED.value == "helped"
+    assert m.NullEpisodeReflector is not None
+    assert m.EvalAuditor is not None
+    assert m.NullOutcomeProvider is not None

@@ -2,6 +2,18 @@
 
 from mobilegui_ltm.api import MemoryStore, create_store
 from mobilegui_ltm.blocks import DEFAULT_BLOCKS, MemoryBlock
+from mobilegui_ltm.diagnostics import (
+    Attribution,
+    CallableOutcomeProvider,
+    DiagnosticReport,
+    EpisodeTrace,
+    EvalAuditor,
+    FailureClass,
+    MemoryAction,
+    NullEpisodeReflector,
+    NullOutcomeProvider,
+    OnlineDiagnostics,
+)
 from mobilegui_ltm.encode.anchors import CausalAnchorEncoder
 from mobilegui_ltm.encode.shortcuts import ShortcutEncoder
 from mobilegui_ltm.encode.traj_summarizer import TrajectorySummarizer
@@ -30,19 +42,25 @@ from mobilegui_ltm.schema import (
 )
 from mobilegui_ltm.store.json import JsonFileBackend
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "AppFact",
     "AttemptOutcome",
     "AtomicAction",
+    "Attribution",
     "BM25Retriever",
+    "CallableOutcomeProvider",
     "CatalogLocalRAG",
     "CausalAnchorEncoder",
     "DEFAULT_BLOCKS",
+    "DiagnosticReport",
     "EmbeddingRetriever",
+    "EpisodeTrace",
+    "EvalAuditor",
     "EvalTask",
     "Evidence",
+    "FailureClass",
     "FakeEmbedder",
     "HashingEmbedder",
     "HybridRetriever",
@@ -51,12 +69,16 @@ __all__ = [
     "JsonFileBackend",
     "KeywordRetriever",
     "MATRIX_MODES",
+    "MemoryAction",
     "MemoryBlock",
     "MemoryKind",
     "MemoryProfile",
     "MemoryRecord",
     "MemoryStore",
+    "NullEpisodeReflector",
     "NullLocalRAG",
+    "NullOutcomeProvider",
+    "OnlineDiagnostics",
     "OutcomeStatus",
     "PromptInjector",
     "RecordStatus",

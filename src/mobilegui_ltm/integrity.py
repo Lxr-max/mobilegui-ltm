@@ -16,7 +16,16 @@ from mobilegui_ltm.schema import MemoryRecord
 
 HMAC_ENV = "MOBILEGUI_LTM_HMAC_KEY"
 
-_SKIP_META = {"embedder", "integrity", "content_hash", "signature", "signer"}
+_SKIP_META = {
+    "embedder",
+    "integrity",
+    "content_hash",
+    "signature",
+    "signer",
+    "quarantined",
+    "quarantine_reason",
+    "quarantined_at",
+}
 
 
 def canonical_payload(record: MemoryRecord) -> bytes:

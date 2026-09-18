@@ -1,4 +1,4 @@
-"""CLI: dummy pass@k demo with LTM on / off and a kind-profile matrix."""
+"""CLI: dummy pass@k demo with LTM on / off, kind matrix, and diagnostics."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from mobilegui_ltm.adapters.pass_at_k import (
     run_ltm_ablation,
 )
 from mobilegui_ltm.api import MemoryStore, create_store
+from mobilegui_ltm.diagnostics.auditor import EvalAuditor
 from mobilegui_ltm.profiles import MATRIX_MODES
 
 _LTM_CHOICES = (
@@ -27,6 +28,7 @@ _LTM_CHOICES = (
     "shortcuts-only",
     "anchors",
     "matrix",
+    "diagnose",
 )
 
 
@@ -37,12 +39,15 @@ def _store(
     label: str,
     retriever: str = "bm25",
     profile: str | None = None,
+    diagnostics: bool = False,
 ) -> MemoryStore:
     kwargs: dict = {}
     if retriever and retriever != "bm25":
         kwargs["retriever"] = retriever
     if profile is not None:
         kwargs["profile"] = profile
+    if diagnostics:
+        kwargs["diagnostics"] = True
     return create_store(
         data_dir / label, agent_id="dummy-shopping", enabled=enabled, **kwargs
     )
@@ -67,16 +72,59 @@ def _print_report(report: PassAtKReport, *, label: str | None = None) -> None:
           f"recovery_after_failure={int(report.recovered_after_failure)}")
 
 
+def _print_diagnostics(
+    store: MemoryStore,
+    *,
+    apply_diagnostics: bool = False,
+) -> None:
+    diag = store.diagnostics
+    dry_run = not apply_diagnostics
+    if diag is None:
+        print("OnlineDiagnostics  (disabled)")
+        return
+    if apply_diagnostics:
+        diag.apply(dry_run=False, include_reflector=False)
+    else:
+        diag.apply(dry_run=True, include_reflector=False)
+    print()
+    print(diag.format_history(dry_run=dry_run))
+    audit = EvalAuditor().scan(store)
+    print(audit.format_summary())
+    if audit.actions:
+        for action in audit.actions:
+            target = action.logical_key or action.target_id or "?"
+            print(f"  {action.type.value} {target}  ({action.reason})")
+    else:
+        print("  (no additional quarantine suggestions)")
+
+
 def run_demo(
     *,
     ltm: str = "ablate",
     k: int = 2,
     data_dir: Path | None = None,
     retriever: str = "bm25",
+    apply_diagnostics: bool = False,
 ) -> AblationReport | PassAtKReport | MatrixReport:
     data_dir = data_dir or (Path.cwd() / "demo_store")
     data_dir.mkdir(parents=True, exist_ok=True)
     task = shopping_task()
+
+    if ltm == "diagnose":
+        store = _store(
+            data_dir,
+            enabled=True,
+            label="diagnose",
+            retriever=retriever,
+            profile="full",
+            diagnostics=True,
+        )
+        report = PassAtKRunner(store, DummyGUIAgent(), ltm_enabled=store.enabled).run(
+            task, k=k
+        )
+        _print_report(report, label="diagnose")
+        _print_diagnostics(store, apply_diagnostics=apply_diagnostics)
+        return report
 
     if ltm == "matrix":
         report = run_ablation_matrix(
@@ -141,7 +189,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Dummy pass@k shopping task: attempt 1 fails, attempt 2 can recover "
             "when long-term memory is left on (no reset between attempts). "
-            "Use --matrix for off / failures-only / shortcuts-only / anchors / full."
+            "Use --matrix for off / failures-only / shortcuts-only / anchors / full. "
+            "Use --diagnose for OnlineDiagnostics (attribution, promote/demote, auditor)."
         ),
     )
     parser.add_argument(
@@ -150,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="ablate",
         help=(
             "Enable LTM, disable it, compare on/off, run one kind profile, "
-            "or run the full ablation matrix."
+            "run the full ablation matrix, or print online diagnostics."
         ),
     )
     parser.add_argument(
@@ -164,6 +213,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Shorthand for --ltm matrix (off, failures-only, shortcuts-only, "
             "anchors, full)."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "Shorthand for --ltm diagnose: dummy shopping task plus ASCII "
+            "attribution / promote / demote / auditor summary (dry-run apply)."
+        ),
+    )
+    parser.add_argument(
+        "--apply-diagnostics",
+        action="store_true",
+        help=(
+            "With --diagnose, apply conservative promote/demote/quarantine. "
+            "Default is dry-run. Reflector rewrites are never auto-applied."
         ),
     )
     parser.add_argument(
@@ -193,11 +258,19 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --k must be >= 1", file=sys.stderr)
         return 2
     ltm = args.ltm
-    if args.matrix:
+    if args.diagnose:
+        ltm = "diagnose"
+    elif args.matrix:
         ltm = "matrix"
     elif args.ablate:
         ltm = "ablate"
-    run_demo(ltm=ltm, k=args.k, data_dir=args.data_dir, retriever=args.retriever)
+    run_demo(
+        ltm=ltm,
+        k=args.k,
+        data_dir=args.data_dir,
+        retriever=args.retriever,
+        apply_diagnostics=args.apply_diagnostics,
+    )
     return 0
 
 
