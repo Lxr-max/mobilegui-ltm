@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Sequence
 
-from mobilegui_ltm.schema import MemoryKind, MemoryRecord, RecordStatus, ShortcutSpec
+from mobilegui_ltm.schema import MemoryKind, MemoryRecord, RecordStatus, ShortcutSpec, Stability
 
 _TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
@@ -19,6 +19,7 @@ DEFAULT_KIND_WEIGHTS: dict[str, float] = {
     MemoryKind.SUBGOAL_TRACE.value: 0.9,
     MemoryKind.SHORTCUT.value: 1.1,
     MemoryKind.CAUSAL_ANCHOR.value: 1.05,
+    MemoryKind.APP_PRIOR.value: 0.85,
 }
 
 
@@ -128,6 +129,32 @@ def precondition_bonus(
         return 1.0
     hits = sum(1 for tok in needles if tok in hay)
     return 1.0 + 0.12 * hits
+
+
+def apply_stability_filter(
+    records: Iterable[MemoryRecord],
+    *,
+    include_candidates: bool = True,
+    include_retired: bool = False,
+) -> list[MemoryRecord]:
+    out: list[MemoryRecord] = []
+    for record in records:
+        if record.stability is Stability.RETIRED and not include_retired:
+            continue
+        if record.stability is Stability.CANDIDATE and not include_candidates:
+            continue
+        out.append(record)
+    return out
+
+
+def stability_bonus(record: MemoryRecord, *, prefer_stable: bool = True) -> float:
+    if not prefer_stable:
+        return 1.0
+    if record.stability is Stability.STABLE:
+        return 1.15
+    if record.stability is Stability.RETIRED:
+        return 0.4
+    return 1.0
 
 
 def expand_links(

@@ -19,18 +19,22 @@ layer in between.
 ```
 write_attempt(task_id, attempt_k, traj, outcome)   # success AND failure
 remember / update / delete / get                    # mid-episode CRUD
-retrieve(query, task_id?, app_ids?, k, screen?, …) -> memories
-inject(prompt_or_state, memories) -> augmented
-format_worker_shortcuts(memories)                   # callable-style shortcut text
-export/import(session)                              # cross-machine repro
-clear / namespace(agent_id)                          # multi-agent isolation
-rebuild_index()                                     # re-embed current namespace
+retrieve(..., block=?, blocks=?)                    # optional named view
+inject(..., block=?) / inject_block(prompt, block, query)
+promote / demote                                    # shortcut/anchor gate
+register_app_prior                                  # LocalRAG catalog (no ADB)
+poison                                              # integrity eval fixture
+format_worker_shortcuts(memories)
+export/import(session)
+clear / namespace(agent_id)
+rebuild_index()
 ```
 
-`create_store(path, agent_id=..., enabled=True, retriever=..., embedder=...,
-profile=..., kind_weights=..., expand_hops=..., strict_task=...)` is the
-factory. `enabled=False` makes write/retrieve/inject into no-ops (LTM-off
-ablation) without changing call sites.
+`create_store(..., profile=..., kind_weights=..., expand_hops=...,
+local_rag=..., blend_local_rag=..., integrity=..., hmac_key=...,
+promote_after=..., include_candidates=...)` is the factory.
+`enabled=False` makes write/retrieve/inject into no-ops (LTM-off ablation)
+without changing call sites.
 
 Profiles (`off` / `ltm-off`, `failures-only`, `shortcuts-only`, `anchors`,
 `full` / `on` / `ltm-on`) set write/retrieve kinds and whether 1-hop expand
@@ -64,9 +68,14 @@ Callers swap these without forking an agent:
    shortcuts / causal anchors.
 3. **Retriever** — BM25, hybrid (BM25 + cosine), or vector-only. Kind
    weights and shortcut precondition soft-match are applied at score time.
-4. **Injector** — which segment of system / planner / worker (configurable).
+4. **Injector** — which segment of system / planner / worker; optional named
+   memory **block** so a planner is not forced to ingest worker shortcuts.
 5. **Embedder** (optional) — hashing (default local), FakeEmbedder (tests),
    sentence-transformers (optional extra).
+6. **LocalRAG** (optional, default off) — installed-app / package catalog.
+   Stub (`NullLocalRAG`) or in-memory `CatalogLocalRAG`. No device I/O.
+7. **IntegrityGuard** (optional, default off) — SHA-256 + optional HMAC
+   research hooks for poisoning experiments. Not a crypto product.
 
 Persistence is **structured JSON**. There is **no graph database**.
 
@@ -81,11 +90,14 @@ Do not copy generic chat logs. Store:
 | Failure notes | Failure mode + next-time avoidance; supports recovery-after-failure metrics. |
 | Shortcuts | Executable specs from successful (or clean partial) trajectories. |
 | Causal anchors | `content` + `evidence` (app/screen/widget) + `depends_on[]` (ids or logical keys). |
+| App priors | Optional LocalRAG catalog rows (`MemoryKind.APP_PRIOR`). Default off. |
 
 `MemoryRecord.embedding` holds an optional dense vector. JSON export/import
 preserves it. A sidecar `{agent}.vectors.json` stores `{id: vector}` plus
 embedder name/dim for rebuilds. `status` is `active` / `superseded` /
-`deleted`.
+`deleted`. `stability` is `candidate` / `stable` / `retired` (promotion
+gate). `block` names the memory view. `content_hash` / `signature` /
+`signer` are integrity stamps when enabled.
 
 ## Shortcuts
 
@@ -201,8 +213,50 @@ failure, so no shortcut is stored).
   task filters; per-kind weights; shortcut precondition soft-match; optional
   1-hop expand.
 - **Injector (`PromptInjector`):** wraps the block in
-  `<mobilegui_ltm>…</mobilegui_ltm>`. Shortcuts render as callable-style
-  blocks; anchors include evidence / depends_on.
+  `<mobilegui_ltm>…</mobilegui_ltm>`. Named blocks add a `[block=name]`
+  section so planner/worker inject can stay isolated. Shortcuts render as
+  callable-style blocks; anchors include evidence / depends_on.
+
+## Named memory blocks
+
+Default registry (overridable via `create_store(blocks=…)`):
+
+- `planner_failures` — failure notes, subgoal traces, causal anchors
+- `worker_shortcuts` — shortcuts
+- `ui_state` — UI facts
+- `app_priors` — LocalRAG catalog hits
+
+`remember(..., block=)` and `retrieve(..., block=)` / `inject(..., block=)`
+select a view. `inject_block(prompt, block, query)` retrieves then injects
+one view. The planner/worker reference adapter retrieves by these names.
+
+## Promotion gate
+
+Promotable kinds (default: shortcuts + causal anchors) start as `candidate`
+when the field was not set explicitly. `write_attempt` increments
+`success_count` on success and `fail_count` on failure for same-`task_id`
+promotable rows (counts are inherited across logical-key supersede). After
+`promote_after` successes the row becomes `stable`. After `demote_after`
+failures, `stable` → `candidate` and `candidate` → `retired`. Explicit
+`promote()` / `demote()` always win. Retrieve: `prefer_stable` score bonus;
+`include_candidates` (default True); retired omitted unless
+`include_retired`.
+
+## LocalRAG
+
+Default `NullLocalRAG` (off). `CatalogLocalRAG` is an in-memory package
+list. `retrieve(..., blend_local_rag=True)` appends ephemeral `app_prior`
+records after LTM ranking. `AndroidWorldAdapter.register_app_prior` writes
+catalog rows without importing or calling ADB.
+
+## Integrity research hooks
+
+`IntegrityGuard` stamps `content_hash` (SHA-256 of canonical content
+fields; embeddings excluded) and optional HMAC (`hmac_key` or
+`MOBILEGUI_LTM_HMAC_KEY`). Retrieve verifies and drops mismatches when
+`drop_unverified=True`. `poison()` / `tamper()` mutate content without
+refreshing the hash. This is a measurement rail for poisoning studies, not
+a production signing scheme.
 
 ## Backend layout
 
@@ -218,7 +272,6 @@ embedder.
 
 ## Later work
 
-- Integrity / poisoning research hooks (CoMemOffset-style signing)
 - Thicker env adapters
 - SQLite / external vector DB backends
 

@@ -17,7 +17,7 @@ from mobilegui_ltm.retrieve.embedder import (
     resolve_embedder,
 )
 from mobilegui_ltm.retrieve.keyword import BM25Retriever, _filter_apps
-from mobilegui_ltm.retrieve.scoring import kind_weight, normalize_kind_weights, precondition_bonus
+from mobilegui_ltm.retrieve.scoring import kind_weight, normalize_kind_weights, precondition_bonus, stability_bonus
 from mobilegui_ltm.schema import MemoryRecord
 
 # Re-export cosine for existing tests.
@@ -80,6 +80,7 @@ class HybridRetriever:
                 k=k,
                 kind_weights=weights,
                 state=state,
+                prefer_stable=bool(_kwargs.get("prefer_stable", True)),
             )
 
         query_vec = self.embedder.embed_query(query)
@@ -101,6 +102,9 @@ class HybridRetriever:
                 score *= self.task_boost
             score *= kind_weight(record, weights)
             score *= precondition_bonus(record, query, state)
+            score *= stability_bonus(
+                record, prefer_stable=bool(_kwargs.get("prefer_stable", True))
+            )
             fused.append((score, record))
         fused.sort(key=lambda pair: pair[0], reverse=True)
         positive = [record for score, record in fused if score > 0]

@@ -62,3 +62,23 @@ class AndroidWorldAdapter:
         outcome: Any,
     ) -> list[MemoryRecord]:
         return self.store.write_attempt(task_id, attempt_k, traj, outcome)
+
+    def register_app_prior(
+        self,
+        app_id: str,
+        *,
+        name: str = "",
+        summary: str = "",
+        capabilities: Sequence[str] | None = None,
+        package: str | None = None,
+        extras: dict[str, Any] | None = None,
+    ) -> Any:
+        """Record an installed-app catalog row. Does not call ADB or a device."""
+        return self.store.register_app_prior(
+            app_id,
+            name=name,
+            summary=summary,
+            capabilities=capabilities,
+            package=package,
+            extras=extras,
+        )

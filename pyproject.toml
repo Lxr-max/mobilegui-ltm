@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mobilegui-ltm"
-version = "0.3.0"
+version = "0.4.0"
 description = "Pluggable long-term memory SDK for mobile GUI agents (write, retrieve, inject across pass@k attempts)."
 readme = "README.md"
 license = { text = "MIT" }

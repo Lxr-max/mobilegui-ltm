@@ -85,4 +85,6 @@ class Injector(Protocol):
         memories: Sequence[MemoryRecord],
         *,
         target: InjectionTarget | str = InjectionTarget.SYSTEM,
+        block: str | None = None,
+        split_blocks: bool = False,
     ) -> Any: ...

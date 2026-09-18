@@ -34,7 +34,11 @@ class PlannerWorkerAdapter:
         app_ids: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
         records = self.store.retrieve(
-            query, task_id=task_id, app_ids=app_ids, k=self.planner_k * 2
+            query,
+            task_id=task_id,
+            app_ids=app_ids,
+            k=self.planner_k * 2,
+            blocks=("planner_failures", "ui_state"),
         )
         preferred = (
             MemoryKind.FAILURE_NOTE,
@@ -59,12 +63,7 @@ class PlannerWorkerAdapter:
             task_id=task_id,
             app_ids=app_ids,
             k=self.worker_k * 2,
-            kinds=(
-                MemoryKind.UI_FACT,
-                MemoryKind.SHORTCUT,
-                MemoryKind.FAILURE_NOTE,
-                MemoryKind.CAUSAL_ANCHOR,
-            ),
+            blocks=("worker_shortcuts", "ui_state"),
         )
         ui_first = [r for r in records if r.kind == MemoryKind.UI_FACT]
         shortcuts = [r for r in records if r.kind == MemoryKind.SHORTCUT]

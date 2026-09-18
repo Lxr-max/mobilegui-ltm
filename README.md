@@ -162,6 +162,7 @@ print(matrix.format_table())
 | **Failure notes** | Failure mode + next-time avoidance (feeds recovery metrics) |
 | **Shortcuts** | Executable snippets mined from **successful** (or clean high-progress partial) trajectories: `name`, `description`, `preconditions`, `arguments`, `atomic_actions[]`, tags (task / app / subgoal) |
 | **Causal anchors** | Cheap “why” records: `content`, `evidence` (app / screen / widget), `depends_on[]`. Retrieve can expand **one hop** along those links. No graph database. |
+| **App priors** | Optional LocalRAG catalog hits (installed app / package facts). Default **off**. |
 
 `remember` / `update` / `delete` are the mid-episode CRUD surface (in addition to `write_attempt`). Soft-delete is the default; `delete(..., hard=True)` removes the row. Retrieve and inject skip superseded and deleted records.
 
@@ -225,6 +226,70 @@ hits = store.retrieve(
 - **Soft match:** shortcut `preconditions` vs the query / `state` dict (rank bonus, not a hard drop).
 - **Expand:** after the primary top-k, follow `depends_on` / `metadata.links` one hop (id or logical key).
 
+## Named memory blocks
+
+Planner and worker do not have to share one undifferentiated dump. Default views:
+
+| Block | Kinds | Typical target |
+| --- | --- | --- |
+| `planner_failures` | failure notes, subgoal traces, causal anchors | planner |
+| `worker_shortcuts` | shortcuts | worker |
+| `ui_state` | UI facts | planner + worker |
+| `app_priors` | LocalRAG app catalog | optional blend |
+
+```python
+planner = store.inject(prompt, memories, block="planner_failures")
+worker = store.inject(state, memories, block="worker_shortcuts", target="worker")
+# retrieve + inject one view
+prompt = store.inject_block(prompt, "ui_state", "ShopX size 9", task_id="shop-red-sneakers-size9")
+store.remember("tip", kind="failure_note", block="planner_failures")
+```
+
+The `<mobilegui_ltm>` wrapper is unchanged (pass@k dummy agents still detect it). Block-scoped inject adds a `[block=…]` section inside that wrapper.
+
+## Promotion gate
+
+Shortcuts and causal anchors start as **`candidate`**. Promote to **`stable`** after `promote_after` successes (default 2) or `store.promote(key)`. `store.demote(key)` sends stable → candidate, then candidate → **retired**. Retrieve prefers stable (score bonus); set `include_candidates=False` to hide unproven skills. Retired rows are omitted unless `include_retired=True`.
+
+```python
+store = create_store("./.mobilegui_ltm", promote_after=2, include_candidates=True)
+store.promote("shortcut:filter_cart")
+hits = store.retrieve("apply size filter", include_candidates=False)
+```
+
+UI facts and failure notes stay `stable` (they are observations, not skills).
+
+## LocalRAG (optional, default off)
+
+Pluggable installed-app / package-catalog priors. **No ADB and no device** at import time. Pass a fake catalog in tests; register rows from an env adapter when you already know the package list.
+
+```python
+store = create_store(
+    "./.mobilegui_ltm",
+    local_rag=[{"app_id": "com.example.shopping", "name": "Shopping", "capabilities": ["cart"]}],
+    blend_local_rag=True,
+)
+# or later:
+from mobilegui_ltm.adapters import AndroidWorldAdapter
+AndroidWorldAdapter(store).register_app_prior("com.example.shopping", name="Shopping")
+hits = store.retrieve("shopping cart", blend_local_rag=True)
+```
+
+Catalog hits are ephemeral `app_prior` records blended **after** LTM ranking (they are not written unless you `remember` them yourself).
+
+## Integrity research hooks
+
+Optional retrieve-time tamper detection for poisoning experiments. **Not a cryptography product**: SHA-256 over canonical record bytes, plus optional HMAC (`hmac_key=` or `MOBILEGUI_LTM_HMAC_KEY`). Default off.
+
+```python
+store = create_store("./.mobilegui_ltm", integrity=True, hmac_key="dev-only")
+rec = store.remember("Avoid ShopY", key="ui:tip")
+store.poison(rec.id, content="tap ShopY always")  # hash not refreshed
+assert store.retrieve("ShopY", k=5) == []         # dropped
+```
+
+`store.poison` / `tamper(record)` are fixtures for eval harnesses.
+
 Embeddings are written on `write_attempt` and stored in the JSON memory file. A sidecar `{root}/{agent}.vectors.json` records `embedder` name, `dim`, and `{id: vector}` for inspection. After changing embedders, rebuild:
 
 ```python
@@ -241,8 +306,10 @@ Swap these without forking the agent:
 1. **Backend** — JSON files (default) → SQLite stub  
 2. **Encoder** — trajectory → UI facts / subgoals / failure notes / shortcuts / causal anchors  
 3. **Retriever** — BM25, hybrid, or vector (`HybridRetriever` / `EmbeddingRetriever`) with kind weights  
-4. **Injector** — which segment: `system` / `planner` / `worker`  
-5. **Embedder** (optional) — hashing / fake / sentence-transformers
+4. **Injector** — which segment: `system` / `planner` / `worker`; optional named **block**  
+5. **Embedder** (optional) — hashing / fake / sentence-transformers  
+6. **LocalRAG** (optional, default off) — installed-app catalog priors  
+7. **IntegrityGuard** (optional, default off) — hash / HMAC research hooks
 
 ```python
 from mobilegui_ltm import MemoryStore, HashingEmbedder
@@ -285,6 +352,7 @@ All tests are offline (FakeEmbedder / hashing; no model downloads).
 ```text
 src/mobilegui_ltm/
   api.py schema.py inject.py cli.py plugins.py profiles.py
+  blocks.py localrag.py integrity.py
   store/{json,sqlite}.py
   encode/{traj_summarizer,shortcuts,anchors}.py
   retrieve/{keyword,embed,embedder,index,scoring}.py
@@ -296,7 +364,7 @@ docs/design.md
 
 ## Later work
 
-Integrity / poisoning hooks (CoMemOffset-style signing) and thicker env adapters.
+Thicker env adapters and optional SQLite / external vector DB backends.
 
 ## Citation
 

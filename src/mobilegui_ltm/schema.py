@@ -25,12 +25,24 @@ class MemoryKind(str, Enum):
     FAILURE_NOTE = "failure_note"
     SHORTCUT = "shortcut"
     CAUSAL_ANCHOR = "causal_anchor"
+    APP_PRIOR = "app_prior"
+
+
+PROMOTABLE_KINDS = frozenset({MemoryKind.SHORTCUT, MemoryKind.CAUSAL_ANCHOR})
 
 
 class RecordStatus(str, Enum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
     DELETED = "deleted"
+
+
+class Stability(str, Enum):
+    """Promotion gate for shortcuts / anchors (observations stay stable)."""
+
+    CANDIDATE = "candidate"
+    STABLE = "stable"
+    RETIRED = "retired"
 
 
 class OutcomeStatus(str, Enum):
@@ -171,9 +183,19 @@ class MemoryRecord(BaseModel):
     superseded_by: str | None = None
     screen: str | None = None
     depends_on: list[str] = Field(default_factory=list)
+    block: str | None = None
+    stability: Stability = Stability.STABLE
+    success_count: int = 0
+    fail_count: int = 0
+    content_hash: str | None = None
+    signature: str | None = None
+    signer: str | None = None
 
     def is_active(self) -> bool:
         return self.status is RecordStatus.ACTIVE
+
+    def is_promotable(self) -> bool:
+        return self.kind in PROMOTABLE_KINDS
 
     def searchable_text(self) -> str:
         apps = " ".join(self.app_ids)
@@ -183,6 +205,9 @@ class MemoryRecord(BaseModel):
             extra_bits.append(self.logical_key)
         if self.screen:
             extra_bits.append(self.screen)
+        if self.block:
+            extra_bits.append(self.block)
+        extra_bits.append(self.stability.value)
         extra_bits.extend(self.depends_on)
         if self.kind is MemoryKind.SHORTCUT:
             spec = ShortcutSpec.from_record(self)
