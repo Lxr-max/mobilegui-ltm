@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Sequence
 
+from mobilegui_ltm.blocks import record_block
 from mobilegui_ltm.schema import InjectionTarget, MemoryKind, MemoryRecord, ShortcutSpec
 
 LTM_START = "<mobilegui_ltm>"
@@ -20,6 +21,7 @@ _KIND_HEADINGS = {
     MemoryKind.SUBGOAL_TRACE: "Subgoal trace (progress / where stuck)",
     MemoryKind.SHORTCUT: "Shortcuts (reusable actions)",
     MemoryKind.CAUSAL_ANCHOR: "Causal anchors (why / evidence)",
+    MemoryKind.APP_PRIOR: "App priors (installed package catalog)",
 }
 
 _KIND_ORDER = (
@@ -28,18 +30,59 @@ _KIND_ORDER = (
     MemoryKind.SUBGOAL_TRACE,
     MemoryKind.SHORTCUT,
     MemoryKind.CAUSAL_ANCHOR,
+    MemoryKind.APP_PRIOR,
 )
 
 
-def format_memories(memories: Sequence[MemoryRecord], *, header: str | None = None) -> str:
-    """Render memories as a prompt block. Empty input → empty string."""
+def format_memories(
+    memories: Sequence[MemoryRecord],
+    *,
+    header: str | None = None,
+    block: str | None = None,
+    split_blocks: bool = False,
+) -> str:
+    """Render memories as a prompt block. Empty input → empty string.
+
+    Default is one ``<mobilegui_ltm>`` wrapper (pass@k dummy agent looks for
+    that exact marker). When ``block`` or ``split_blocks`` is set, the same
+    wrapper is kept and contents are sectioned by named memory block so a
+    planner/worker does not always receive an undifferentiated dump.
+    """
     if not memories:
         return ""
-    title = header or "Long-term memory for this mobile GUI attempt"
+    if split_blocks:
+        grouped: dict[str, list[MemoryRecord]] = defaultdict(list)
+        for record in memories:
+            grouped[record_block(record)].append(record)
+        chunks = []
+        for name in grouped:
+            inner = _format_kind_sections(
+                grouped[name],
+                header=header or f"Memory block: {name}",
+            )
+            if inner:
+                chunks.append(f"[block={name}]\n{inner}")
+        if not chunks:
+            return ""
+        body = "\n".join(chunks)
+        return f"{LTM_START}\n{body.rstrip()}\n{LTM_END}\n"
+    title = header or (
+        f"Long-term memory block '{block}'"
+        if block
+        else "Long-term memory for this mobile GUI attempt"
+    )
+    inner = _format_kind_sections(list(memories), header=title)
+    if not inner:
+        return ""
+    prefix = f"[block={block}]\n" if block else ""
+    return f"{LTM_START}\n{prefix}{inner.rstrip()}\n{LTM_END}\n"
+
+
+def _format_kind_sections(memories: Sequence[MemoryRecord], *, header: str) -> str:
     grouped: dict[MemoryKind, list[MemoryRecord]] = defaultdict(list)
     for record in memories:
         grouped[record.kind].append(record)
-    lines = [LTM_START, title, "Do not reset these notes between pass@k attempts.", ""]
+    lines = [header, "Do not reset these notes between pass@k attempts.", ""]
     for kind in _KIND_ORDER:
         bucket = grouped.get(kind) or []
         if not bucket:
@@ -63,8 +106,13 @@ def format_memories(memories: Sequence[MemoryRecord], *, header: str | None = No
                 if record.depends_on:
                     lines.append("  depends_on: " + ", ".join(record.depends_on))
         lines.append("")
-    lines.append(LTM_END)
-    return "\n".join(lines).strip() + "\n"
+    leftover = [k for k in grouped if k not in _KIND_ORDER]
+    for kind in leftover:
+        lines.append(f"### {kind.value}")
+        for record in grouped[kind]:
+            lines.append(f"- [{record.kind.value}] {record.content}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def format_shortcut_for_worker(record: MemoryRecord) -> str:
@@ -110,19 +158,33 @@ class PromptInjector:
         memories: Sequence[MemoryRecord],
         *,
         target: InjectionTarget | str | None = None,
+        block: str | None = None,
+        split_blocks: bool = False,
     ) -> Any:
-        block = format_memories(memories, header=self.header)
+        block_name = block
+        formatted = format_memories(
+            memories,
+            header=self.header,
+            block=block_name,
+            split_blocks=split_blocks,
+        )
         resolved = InjectionTarget(target or self.default_target)
-        if not block:
+        if not formatted:
             return prompt_or_state
         if prompt_or_state is None:
-            return block
+            return formatted
         if isinstance(prompt_or_state, str):
-            return self._merge_text(prompt_or_state, block)
+            return self._merge_text(prompt_or_state, formatted)
         if isinstance(prompt_or_state, dict):
-            return self._merge_dict(prompt_or_state, block, resolved, memories)
+            return self._merge_dict(
+                prompt_or_state,
+                formatted,
+                resolved,
+                memories,
+                block_name=block_name,
+            )
         text = str(prompt_or_state)
-        return self._merge_text(text, block)
+        return self._merge_text(text, formatted)
 
     def _merge_text(self, original: str, block: str) -> str:
         if self.placement == "append":
@@ -139,6 +201,8 @@ class PromptInjector:
         block: str,
         target: InjectionTarget,
         memories: Sequence[MemoryRecord],
+        *,
+        block_name: str | None = None,
     ) -> dict[str, Any]:
         merged = dict(state)
         key = target.value
@@ -163,4 +227,6 @@ class PromptInjector:
         merged[dest] = self._merge_text(previous, block)
         merged["_ltm_target"] = target.value
         merged["_ltm_memory_ids"] = [record.id for record in memories]
+        if block_name:
+            merged["_ltm_block"] = block_name
         return merged

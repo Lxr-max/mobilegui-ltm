@@ -15,6 +15,7 @@ from mobilegui_ltm.retrieve.scoring import (
     kind_weight,
     normalize_kind_weights,
     precondition_bonus,
+    stability_bonus,
     tokenize,
 )
 
@@ -76,6 +77,7 @@ class BM25Retriever:
             query=query,
             state=state,
             kind_weights=kind_weights,
+            prefer_stable=bool(_kwargs.get("prefer_stable", True)),
         )
         ranked = sorted(
             zip(scores, candidates, strict=True),
@@ -95,6 +97,7 @@ class BM25Retriever:
         state: object = None,
         kind_weights: dict | None = None,
         apply_bonuses: bool = True,
+        prefer_stable: bool = True,
     ) -> list[float]:
         """Raw BM25 scores aligned with ``records`` (no app filter)."""
         if not records:
@@ -110,6 +113,7 @@ class BM25Retriever:
             state=state,
             kind_weights=kind_weights,
             apply_bonuses=apply_bonuses,
+            prefer_stable=prefer_stable,
         )
 
     def _score(
@@ -122,6 +126,7 @@ class BM25Retriever:
         state: object = None,
         kind_weights: dict | None = None,
         apply_bonuses: bool = True,
+        prefer_stable: bool = True,
     ) -> list[float]:
         docs = [tokenize(r.searchable_text()) for r in records]
         lengths = [max(len(doc), 1) for doc in docs]
@@ -152,6 +157,7 @@ class BM25Retriever:
                 weights = normalize_kind_weights(kind_weights or self.kind_weights)
                 score *= kind_weight(record, weights)
                 score *= precondition_bonus(record, query, state)
+                score *= stability_bonus(record, prefer_stable=prefer_stable)
             scores.append(score)
         return scores
 

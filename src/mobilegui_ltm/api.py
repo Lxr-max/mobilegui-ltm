@@ -9,8 +9,23 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Sequence
 
+from mobilegui_ltm.blocks import (
+    MemoryBlock,
+    block_for_kind,
+    filter_blocks,
+    normalize_block_names,
+    resolve_block_registry,
+)
 from mobilegui_ltm.encode.traj_summarizer import TrajectorySummarizer
 from mobilegui_ltm.inject import PromptInjector, format_shortcut_for_worker
+from mobilegui_ltm.integrity import IntegrityGuard, resolve_integrity, tamper
+from mobilegui_ltm.localrag import (
+    CatalogLocalRAG,
+    LocalRAG,
+    NullLocalRAG,
+    facts_to_records,
+    resolve_local_rag,
+)
 from mobilegui_ltm.plugins import Backend, Embedder, Encoder, Injector, Retriever
 from mobilegui_ltm.profiles import MemoryProfile, resolve_profile
 from mobilegui_ltm.retrieve.embed import EmbeddingRetriever, HybridRetriever
@@ -20,10 +35,12 @@ from mobilegui_ltm.retrieve.keyword import BM25Retriever
 from mobilegui_ltm.retrieve.scoring import (
     active_only,
     apply_hard_filters,
+    apply_stability_filter,
     expand_links,
     normalize_kind_weights,
 )
 from mobilegui_ltm.schema import (
+    PROMOTABLE_KINDS,
     AttemptOutcome,
     EvalTask,
     InjectionTarget,
@@ -31,6 +48,7 @@ from mobilegui_ltm.schema import (
     MemoryRecord,
     OutcomeStatus,
     RecordStatus,
+    Stability,
     SessionBundle,
     Trajectory,
     coerce_outcome,
@@ -73,6 +91,20 @@ class MemoryStore:
         kind_weights: dict[str, float] | dict[MemoryKind, float] | None = None,
         expand_hops: int = 0,
         strict_task: bool = False,
+        blocks: dict[str, MemoryBlock | Sequence[MemoryKind | str]] | Sequence[MemoryBlock] | None = None,
+        local_rag: LocalRAG | bool | Sequence[Any] | None = None,
+        blend_local_rag: bool = False,
+        local_rag_k: int = 3,
+        include_candidates: bool = True,
+        include_retired: bool = False,
+        prefer_stable: bool = True,
+        promote_after: int = 2,
+        demote_after: int = 2,
+        promote_kinds: Sequence[MemoryKind] | None = None,
+        integrity: IntegrityGuard | bool | None = None,
+        hmac_key: str | bytes | None = None,
+        verify_on_retrieve: bool = True,
+        drop_unverified: bool = True,
     ) -> None:
         self.backend = backend
         self.encoder = encoder or TrajectorySummarizer()
@@ -88,6 +120,22 @@ class MemoryStore:
         self.kind_weights = normalize_kind_weights(kind_weights)
         self.expand_hops = int(expand_hops)
         self.strict_task = strict_task
+        self.blocks = resolve_block_registry(blocks)
+        self.local_rag: LocalRAG = resolve_local_rag(local_rag)
+        self.blend_local_rag = bool(blend_local_rag)
+        self.local_rag_k = int(local_rag_k)
+        self.include_candidates = include_candidates
+        self.include_retired = include_retired
+        self.prefer_stable = prefer_stable
+        self.promote_after = max(1, int(promote_after))
+        self.demote_after = max(1, int(demote_after))
+        self.promote_kinds = tuple(promote_kinds) if promote_kinds is not None else tuple(PROMOTABLE_KINDS)
+        self.integrity = resolve_integrity(
+            integrity,
+            hmac_key=hmac_key,
+            verify_on_retrieve=verify_on_retrieve,
+            drop_unverified=drop_unverified,
+        )
 
     # --- core contract -------------------------------------------------
 
@@ -106,7 +154,9 @@ class MemoryStore:
         records = self.encoder.encode(
             task_id, attempt_k, trajectory, result, self.agent_id
         )
-        return self._commit(records)
+        written = self._commit(records)
+        self._apply_promotion_gate(result, task_id=task_id, app_ids=trajectory.app_ids)
+        return written
 
     def remember(
         self,
@@ -122,10 +172,17 @@ class MemoryStore:
         metadata: dict[str, Any] | None = None,
         depends_on: Sequence[str] | None = None,
         supersede: bool = True,
+        block: str | None = None,
+        stability: Stability | str | None = None,
     ) -> MemoryRecord | None:
         """Insert a fact mid-episode. Same ``key`` supersedes the previous active value."""
         if not self.enabled:
             return None
+        kwargs: dict[str, Any] = {}
+        if block is not None:
+            kwargs["block"] = block
+        if stability is not None:
+            kwargs["stability"] = Stability(stability)
         record = MemoryRecord(
             kind=MemoryKind(kind),
             content=content,
@@ -138,6 +195,7 @@ class MemoryStore:
             logical_key=key,
             screen=screen,
             depends_on=list(depends_on or []),
+            **kwargs,
         )
         written = self._commit(
             [record], supersede=supersede, respect_write_kinds=False
@@ -153,6 +211,8 @@ class MemoryStore:
         tags: Sequence[str] | None = None,
         metadata: dict[str, Any] | None = None,
         depends_on: Sequence[str] | None = None,
+        block: str | None = None,
+        stability: Stability | str | None = None,
     ) -> MemoryRecord | None:
         """In-place update of an active record (by id or logical key)."""
         if not self.enabled:
@@ -173,8 +233,14 @@ class MemoryStore:
             patch["metadata"] = merged
         if depends_on is not None:
             patch["depends_on"] = list(depends_on)
+        if block is not None:
+            patch["block"] = block
+        if stability is not None:
+            patch["stability"] = Stability(stability)
         updated = current.model_copy(update=patch)
         stamped = self._ensure_embeddings([updated], force=True)
+        if self.integrity:
+            stamped = self.integrity.stamp_many(stamped)
         self.backend.upsert(stamped)
         self._sync_sidecar()
         return stamped[0]
@@ -228,6 +294,11 @@ class MemoryStore:
         state: Any = None,
         kind_weights: dict[str, float] | dict[MemoryKind, float] | None = None,
         expand_hops: int | None = None,
+        block: str | None = None,
+        blocks: Sequence[str] | None = None,
+        include_candidates: bool | None = None,
+        prefer_stable: bool | None = None,
+        blend_local_rag: bool | None = None,
     ) -> list[MemoryRecord]:
         """Return top-k memories for this namespace (never resets across attempts)."""
         if not self.enabled:
@@ -235,9 +306,24 @@ class MemoryStore:
         kind_filter = kinds if kinds is not None else self.retrieve_kinds
         pool = self.backend.list(agent_id=self.agent_id, kinds=kind_filter)
         pool = active_only(self._hydrate_vectors(pool))
+        names = normalize_block_names(block, blocks)
+        if names:
+            pool = filter_blocks(pool, names, registry=self.blocks)
+        pool = apply_stability_filter(
+            pool,
+            include_candidates=self.include_candidates
+            if include_candidates is None
+            else include_candidates,
+            include_retired=self.include_retired,
+        )
+        if self.integrity and self.integrity.verify_on_retrieve:
+            ok, bad = self.integrity.check(pool)
+            pool = ok if self.integrity.drop_unverified else ok + bad
         missing = [c for c in pool if self.embedder and not c.embedding]
         if missing:
             filled = self._ensure_embeddings(missing, force=True)
+            if self.integrity:
+                filled = self.integrity.stamp_many(filled)
             self.backend.upsert(filled)
             by_id = {item.id: item for item in filled}
             pool = [by_id.get(c.id, c) for c in pool]
@@ -249,6 +335,7 @@ class MemoryStore:
             task_id=task_id,
             strict_task=self.strict_task if strict_task is None else strict_task,
         )
+        prefer = self.prefer_stable if prefer_stable is None else prefer_stable
         ranked = self.retriever.retrieve(
             candidates,
             query,
@@ -257,10 +344,26 @@ class MemoryStore:
             k=k,
             kind_weights=kind_weights or self.kind_weights,
             state=state,
+            prefer_stable=prefer,
         )
         hops = self.expand_hops if expand_hops is None else expand_hops
         if hops:
             ranked = expand_links(ranked, pool, hops=hops)
+        do_blend = self.blend_local_rag if blend_local_rag is None else blend_local_rag
+        if do_blend and getattr(self.local_rag, "enabled", False):
+            if not names or "app_priors" in names:
+                facts = self.local_rag.lookup(
+                    query, app_ids=app_ids, k=self.local_rag_k
+                )
+                extra = facts_to_records(
+                    facts, agent_id=self.agent_id, task_id=task_id or ""
+                )
+                seen = {item.logical_key or item.id for item in ranked}
+                for item in extra:
+                    key = item.logical_key or item.id
+                    if key not in seen:
+                        ranked.append(item)
+                        seen.add(key)
         return ranked
 
     def inject(
@@ -269,11 +372,122 @@ class MemoryStore:
         memories: Sequence[MemoryRecord],
         *,
         target: InjectionTarget | str = InjectionTarget.SYSTEM,
+        block: str | None = None,
+        blocks: Sequence[str] | None = None,
+        split_blocks: bool | None = None,
     ) -> Any:
-        """Fold memories into a prompt or planner/worker state dict."""
+        """Fold memories into a prompt or planner/worker state dict.
+
+        Pass ``block`` / ``blocks`` to inject one named memory view instead of
+        dumping every retrieved kind into a single undifferentiated blob.
+        """
         if not self.enabled or not memories:
             return prompt_or_state
-        return self.injector.inject(prompt_or_state, memories, target=target)
+        names = normalize_block_names(block, blocks)
+        mems = list(memories)
+        if names:
+            mems = filter_blocks(mems, names, registry=self.blocks)
+            if not mems:
+                return prompt_or_state
+        one = names[0] if len(names) == 1 else None
+        split = (len(names) > 1) if split_blocks is None else split_blocks
+        return self.injector.inject(
+            prompt_or_state,
+            mems,
+            target=target,
+            block=one,
+            split_blocks=split,
+        )
+
+    def inject_block(
+        self,
+        prompt_or_state: Any,
+        block: str,
+        query: str,
+        *,
+        task_id: str | None = None,
+        app_ids: Sequence[str] | None = None,
+        k: int = 8,
+        target: InjectionTarget | str = InjectionTarget.SYSTEM,
+        screen: str | None = None,
+        state: Any = None,
+    ) -> Any:
+        """Retrieve one named block and inject it."""
+        memories = self.retrieve(
+            query,
+            task_id=task_id,
+            app_ids=app_ids,
+            k=k,
+            block=block,
+            screen=screen,
+            state=state,
+        )
+        dest = target
+        return self.inject(prompt_or_state, memories, target=dest, block=block)
+
+    def promote(self, key_or_id: str) -> MemoryRecord | None:
+        """Mark a candidate shortcut/anchor as stable."""
+        if not self.enabled:
+            return None
+        current = self.get(key_or_id, include_inactive=False)
+        if current is None:
+            return None
+        updated = current.model_copy(
+            update={"stability": Stability.STABLE, "fail_count": 0}
+        )
+        return self._persist_records([updated])[0]
+
+    def demote(self, key_or_id: str, *, retire: bool = False) -> MemoryRecord | None:
+        """Demote stable → candidate, or candidate → retired."""
+        if not self.enabled:
+            return None
+        current = self.get(key_or_id, include_inactive=False)
+        if current is None:
+            return None
+        if retire or current.stability is Stability.CANDIDATE:
+            new_state = Stability.RETIRED
+        else:
+            new_state = Stability.CANDIDATE
+        updated = current.model_copy(update={"stability": new_state})
+        return self._persist_records([updated])[0]
+
+    def register_app_prior(
+        self,
+        app_id: str,
+        *,
+        name: str = "",
+        summary: str = "",
+        capabilities: Sequence[str] | None = None,
+        package: str | None = None,
+        extras: dict[str, Any] | None = None,
+    ) -> Any:
+        """Register an installed-app fact on the LocalRAG catalog (no ADB)."""
+        rag = self.local_rag
+        if rag is None or isinstance(rag, NullLocalRAG) or not getattr(rag, "enabled", False):
+            rag = CatalogLocalRAG()
+            self.local_rag = rag
+        return rag.register_app(
+            app_id,
+            name=name,
+            summary=summary,
+            capabilities=capabilities,
+            package=package,
+            extras=extras,
+        )
+
+    def poison(
+        self,
+        key_or_id: str,
+        *,
+        content: str | None = None,
+    ) -> MemoryRecord | None:
+        """Research fixture: mutate content without refreshing ``content_hash``."""
+        current = self.get(key_or_id, include_inactive=True)
+        if current is None:
+            return None
+        poisoned = tamper(current, content=content)
+        self.backend.upsert([poisoned])
+        return poisoned
 
     def export_session(self, path: str | Path | None = None) -> SessionBundle:
         """Export this namespace for cross-machine reproduction."""
@@ -301,6 +515,8 @@ class MemoryStore:
                 r.model_copy(update={"agent_id": self.agent_id}) for r in records
             ]
         records = self._ensure_embeddings(records)
+        if self.integrity:
+            records = self.integrity.stamp_many(records)
         if records:
             self.backend.upsert(records)
             self._sync_sidecar()
@@ -334,6 +550,17 @@ class MemoryStore:
             kind_weights=self.kind_weights,
             expand_hops=self.expand_hops,
             strict_task=self.strict_task,
+            blocks=self.blocks,
+            local_rag=self.local_rag,
+            blend_local_rag=self.blend_local_rag,
+            local_rag_k=self.local_rag_k,
+            include_candidates=self.include_candidates,
+            include_retired=self.include_retired,
+            prefer_stable=self.prefer_stable,
+            promote_after=self.promote_after,
+            demote_after=self.demote_after,
+            promote_kinds=self.promote_kinds,
+            integrity=self.integrity,
         )
 
     def list_memories(
@@ -343,6 +570,8 @@ class MemoryStore:
         app_ids: Sequence[str] | None = None,
         kinds: Sequence[MemoryKind] | None = None,
         include_inactive: bool = False,
+        block: str | None = None,
+        blocks: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
         """Unranked listing for this namespace (debugging / tests)."""
         records = self.backend.list(
@@ -351,6 +580,9 @@ class MemoryStore:
             app_ids=app_ids,
             kinds=kinds,
         )
+        names = normalize_block_names(block, blocks)
+        if names:
+            records = filter_blocks(records, names, registry=self.blocks)
         if include_inactive:
             return records
         return active_only(records)
@@ -388,10 +620,14 @@ class MemoryStore:
         incoming = [
             record.model_copy(update={"agent_id": self.agent_id}) for record in incoming
         ]
+        incoming = self._inherit_promotion(incoming)
+        incoming = [self._assign_defaults(record) for record in incoming]
         incoming = _collapse_logical_keys(incoming)
         if supersede:
             self._supersede_existing(incoming)
         stamped = self._ensure_embeddings(incoming)
+        if self.integrity:
+            stamped = self.integrity.stamp_many(stamped)
         self.backend.upsert(stamped)
         self._sync_sidecar()
         return stamped
@@ -421,6 +657,88 @@ class MemoryStore:
                 )
         if demoted:
             self.backend.upsert(demoted)
+
+    def _assign_defaults(self, record: MemoryRecord) -> MemoryRecord:
+        patch: dict[str, Any] = {}
+        if not record.block:
+            patch["block"] = block_for_kind(record.kind, self.blocks)
+        if record.kind in self.promote_kinds and "stability" not in record.model_fields_set:
+            patch["stability"] = Stability.CANDIDATE
+        if not patch:
+            return record
+        return record.model_copy(update=patch)
+
+    def _inherit_promotion(self, incoming: Sequence[MemoryRecord]) -> list[MemoryRecord]:
+        existing = active_only(self.backend.list(agent_id=self.agent_id))
+        by_key = {
+            (record.kind, record.logical_key): record
+            for record in existing
+            if record.logical_key
+        }
+        out: list[MemoryRecord] = []
+        for record in incoming:
+            if not record.logical_key:
+                out.append(record)
+                continue
+            old = by_key.get((record.kind, record.logical_key))
+            if old is None or old.kind not in self.promote_kinds:
+                out.append(record)
+                continue
+            out.append(
+                record.model_copy(
+                    update={
+                        "success_count": old.success_count,
+                        "fail_count": old.fail_count,
+                        "stability": old.stability,
+                    }
+                )
+            )
+        return out
+
+    def _apply_promotion_gate(
+        self,
+        outcome: AttemptOutcome,
+        *,
+        task_id: str,
+        app_ids: Sequence[str] | None = None,
+    ) -> None:
+        if outcome.status not in {OutcomeStatus.SUCCESS, OutcomeStatus.FAILURE}:
+            return
+        records = [
+            record
+            for record in active_only(self.backend.list(agent_id=self.agent_id))
+            if record.kind in self.promote_kinds
+        ]
+        patched: list[MemoryRecord] = []
+        for record in records:
+            if record.task_id and record.task_id != task_id:
+                continue
+            if outcome.status is OutcomeStatus.SUCCESS:
+                n = record.success_count + 1
+                update: dict[str, Any] = {"success_count": n}
+                if n >= self.promote_after:
+                    update["stability"] = Stability.STABLE
+                    update["fail_count"] = 0
+            else:
+                n = record.fail_count + 1
+                update = {"fail_count": n}
+                if n >= self.demote_after:
+                    update["stability"] = (
+                        Stability.CANDIDATE
+                        if record.stability is Stability.STABLE
+                        else Stability.RETIRED
+                    )
+            patched.append(record.model_copy(update=update))
+        if patched:
+            self._persist_records(patched)
+
+    def _persist_records(self, records: Sequence[MemoryRecord]) -> list[MemoryRecord]:
+        stamped = list(records)
+        if self.integrity:
+            stamped = self.integrity.stamp_many(stamped)
+        self.backend.upsert(stamped)
+        self._sync_sidecar()
+        return stamped
 
     def _soft_delete(self, record: MemoryRecord) -> bool:
         if record.status is RecordStatus.DELETED:
@@ -532,6 +850,20 @@ def create_store(
     kind_weights: dict[str, float] | dict[MemoryKind, float] | None = None,
     expand_hops: int | None = None,
     strict_task: bool = False,
+    blocks: dict[str, MemoryBlock | Sequence[MemoryKind | str]] | Sequence[MemoryBlock] | None = None,
+    local_rag: LocalRAG | bool | Sequence[Any] | None = None,
+    blend_local_rag: bool = False,
+    local_rag_k: int = 3,
+    include_candidates: bool = True,
+    include_retired: bool = False,
+    prefer_stable: bool = True,
+    promote_after: int = 2,
+    demote_after: int = 2,
+    promote_kinds: Sequence[MemoryKind] | None = None,
+    integrity: IntegrityGuard | bool | None = None,
+    hmac_key: str | bytes | None = None,
+    verify_on_retrieve: bool = True,
+    drop_unverified: bool = True,
 ) -> MemoryStore:
     """Factory: JSON-file store under ``path`` (default ``./.mobilegui_ltm``).
 
@@ -544,6 +876,8 @@ def create_store(
         create_store(path, embedder="sentence-transformers")  # needs [embed]
         create_store(path, profile="failures-only")  # ablation profile
         create_store(path, kind_weights={"failure_note": 1.3}, expand_hops=1)
+        create_store(path, local_rag=[{"app_id": "com.shop", "name": "Shop"}], blend_local_rag=True)
+        create_store(path, integrity=True, hmac_key="dev-secret")
     """
     resolved_profile = resolve_profile(profile)
     if resolved_profile is not None:
@@ -582,6 +916,20 @@ def create_store(
         kind_weights=weights,
         expand_hops=hops,
         strict_task=strict_task,
+        blocks=blocks,
+        local_rag=local_rag,
+        blend_local_rag=blend_local_rag,
+        local_rag_k=local_rag_k,
+        include_candidates=include_candidates,
+        include_retired=include_retired,
+        prefer_stable=prefer_stable,
+        promote_after=promote_after,
+        demote_after=demote_after,
+        promote_kinds=promote_kinds,
+        integrity=integrity,
+        hmac_key=hmac_key,
+        verify_on_retrieve=verify_on_retrieve,
+        drop_unverified=drop_unverified,
     )
 
 
