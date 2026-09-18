@@ -7,10 +7,11 @@ The environment (emulator / activity) may reset; this adapter never calls
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from mobilegui_ltm.api import MemoryStore
 from mobilegui_ltm.inject import LTM_START
+from mobilegui_ltm.profiles import MATRIX_MODES, resolve_profile
 from mobilegui_ltm.schema import (
     AttemptOutcome,
     EvalTask,
@@ -113,6 +114,48 @@ class AblationReport:
         return f"{header_line}\n{rule}\n{body}"
 
 
+@dataclass
+class MatrixReport:
+    """Multi-profile ablation: off / failures-only / shortcuts-only / anchors / full."""
+
+    task_id: str
+    k: int
+    reports: dict[str, PassAtKReport] = field(default_factory=dict)
+
+    def as_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for name, report in self.reports.items():
+            rows.append(
+                {
+                    "protocol": name,
+                    "pass@1": float(report.pass_at(1)),
+                    f"pass@{self.k}": float(report.success),
+                    "recovery_after_failure": float(report.recovered_after_failure),
+                    "solved_at": report.solved_at,
+                }
+            )
+        return rows
+
+    def format_table(self) -> str:
+        rows = self.as_rows()
+        if not rows:
+            return ""
+        pass_k = f"pass@{self.k}"
+        headers = ["protocol", "pass@1", pass_k, "recovery_after_failure", "solved_at"]
+        widths = {h: max(len(h), *(len(str(r[h])) for r in rows)) for h in headers}
+
+        def fmt(row: dict[str, Any]) -> str:
+            return " | ".join(str(row[h]).ljust(widths[h]) for h in headers)
+
+        header_line = " | ".join(h.ljust(widths[h]) for h in headers)
+        rule = "-+-".join("-" * widths[h] for h in headers)
+        body = "\n".join(fmt(r) for r in rows)
+        return f"{header_line}\n{rule}\n{body}"
+
+    def report(self, name: str) -> PassAtKReport:
+        return self.reports[name]
+
+
 class PassAtKRunner:
     """Run up to ``k`` attempts, persisting memory across failures when enabled."""
 
@@ -191,3 +234,27 @@ def run_ltm_ablation(
         on_store, agent_factory(), ltm_enabled=True, retrieve_k=retrieve_k
     ).run(task, k=k)
     return AblationReport(task_id=task.task_id, k=k, ltm_off=off_report, ltm_on=on_report)
+
+
+def run_ablation_matrix(
+    task: EvalTask,
+    *,
+    k: int = 2,
+    modes: Sequence[str] = MATRIX_MODES,
+    store_factory: Callable[[str], MemoryStore],
+    agent_factory: Callable[[], MobileGUIAgent],
+    retrieve_k: int = 8,
+) -> MatrixReport:
+    """Run the same task under each memory profile (independent stores)."""
+    reports: dict[str, PassAtKReport] = {}
+    for mode in modes:
+        profile = resolve_profile(mode)
+        store = store_factory(mode)
+        enabled = store.enabled if profile is None else profile.enabled
+        reports[mode] = PassAtKRunner(
+            store,
+            agent_factory(),
+            ltm_enabled=enabled,
+            retrieve_k=retrieve_k,
+        ).run(task, k=k)
+    return MatrixReport(task_id=task.task_id, k=k, reports=reports)

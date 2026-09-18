@@ -17,6 +17,7 @@ from mobilegui_ltm.retrieve.embedder import (
     resolve_embedder,
 )
 from mobilegui_ltm.retrieve.keyword import BM25Retriever, _filter_apps
+from mobilegui_ltm.retrieve.scoring import kind_weight, normalize_kind_weights, precondition_bonus
 from mobilegui_ltm.schema import MemoryRecord
 
 # Re-export cosine for existing tests.
@@ -44,13 +45,15 @@ class HybridRetriever:
         vector_weight: float = 0.5,
         task_boost: float = 1.25,
         fallback: BM25Retriever | None = None,
+        kind_weights: dict | None = None,
     ) -> None:
         resolved = resolve_embedder(embedder) if embedder is not None else HashingEmbedder()
         self.embedder: Embedder = resolved or HashingEmbedder()
         self.lexical_weight = float(lexical_weight)
         self.vector_weight = float(vector_weight)
         self.task_boost = task_boost
-        self.fallback = fallback if fallback is not None else BM25Retriever()
+        self.kind_weights = kind_weights
+        self.fallback = fallback if fallback is not None else BM25Retriever(kind_weights=kind_weights)
 
     def retrieve(
         self,
@@ -60,17 +63,34 @@ class HybridRetriever:
         task_id: str | None = None,
         app_ids: Sequence[str] | None = None,
         k: int = 5,
+        kind_weights: dict | None = None,
+        state: object = None,
+        **_kwargs: object,
     ) -> list[MemoryRecord]:
         candidates = _filter_apps(list(records), app_ids)
         if not candidates or k <= 0:
             return []
+        weights = normalize_kind_weights(kind_weights or self.kind_weights)
         if self.vector_weight <= 0 and self.lexical_weight > 0:
             return self.fallback.retrieve(
-                candidates, query, task_id=task_id, app_ids=None, k=k
+                candidates,
+                query,
+                task_id=task_id,
+                app_ids=None,
+                k=k,
+                kind_weights=weights,
+                state=state,
             )
 
         query_vec = self.embedder.embed_query(query)
-        lexical = self.fallback.scores(candidates, query, task_id=None)
+        lexical = self.fallback.scores(
+            candidates,
+            query,
+            task_id=None,
+            state=state,
+            kind_weights=weights,
+            apply_bonuses=False,
+        )
         vector = [self._vector_score(record, query_vec) for record in candidates]
         lex_n = _minmax(lexical)
         vec_n = _minmax(vector)
@@ -79,6 +99,8 @@ class HybridRetriever:
             score = self.lexical_weight * l_score + self.vector_weight * v_score
             if task_id and record.task_id == task_id:
                 score *= self.task_boost
+            score *= kind_weight(record, weights)
+            score *= precondition_bonus(record, query, state)
             fused.append((score, record))
         fused.sort(key=lambda pair: pair[0], reverse=True)
         positive = [record for score, record in fused if score > 0]
@@ -105,6 +127,7 @@ class EmbeddingRetriever(HybridRetriever):
         fallback: BM25Retriever | None = None,
         lexical_weight: float = 0.0,
         vector_weight: float = 1.0,
+        kind_weights: dict | None = None,
     ) -> None:
         if embedder is None and embed_query is not None:
             embedder = CallableEmbedder(embed_query)
@@ -113,4 +136,5 @@ class EmbeddingRetriever(HybridRetriever):
             lexical_weight=lexical_weight,
             vector_weight=vector_weight,
             fallback=fallback,
+            kind_weights=kind_weights,
         )

@@ -1,4 +1,4 @@
-"""CLI: dummy pass@k demo with LTM on / off ablation."""
+"""CLI: dummy pass@k demo with LTM on / off and a kind-profile matrix."""
 
 from __future__ import annotations
 
@@ -9,30 +9,47 @@ from pathlib import Path
 from mobilegui_ltm.adapters.dummy import DummyGUIAgent, shopping_task
 from mobilegui_ltm.adapters.pass_at_k import (
     AblationReport,
+    MatrixReport,
     PassAtKReport,
     PassAtKRunner,
+    run_ablation_matrix,
     run_ltm_ablation,
 )
 from mobilegui_ltm.api import MemoryStore, create_store
+from mobilegui_ltm.profiles import MATRIX_MODES
+
+_LTM_CHOICES = (
+    "on",
+    "off",
+    "ablate",
+    "full",
+    "failures-only",
+    "shortcuts-only",
+    "anchors",
+    "matrix",
+)
 
 
 def _store(
     data_dir: Path,
     *,
-    enabled: bool,
+    enabled: bool = True,
     label: str,
     retriever: str = "bm25",
+    profile: str | None = None,
 ) -> MemoryStore:
     kwargs: dict = {}
     if retriever and retriever != "bm25":
         kwargs["retriever"] = retriever
+    if profile is not None:
+        kwargs["profile"] = profile
     return create_store(
         data_dir / label, agent_id="dummy-shopping", enabled=enabled, **kwargs
     )
 
 
-def _print_report(report: PassAtKReport) -> None:
-    mode = "on" if report.ltm_enabled else "off"
+def _print_report(report: PassAtKReport, *, label: str | None = None) -> None:
+    mode = label or ("on" if report.ltm_enabled else "off")
     print(f"LTM {mode}  task={report.task_id}  k={report.k}")
     for attempt in report.attempts:
         status = "SUCCESS" if attempt.success else "FAIL"
@@ -56,10 +73,30 @@ def run_demo(
     k: int = 2,
     data_dir: Path | None = None,
     retriever: str = "bm25",
-) -> AblationReport | PassAtKReport:
+) -> AblationReport | PassAtKReport | MatrixReport:
     data_dir = data_dir or (Path.cwd() / "demo_store")
     data_dir.mkdir(parents=True, exist_ok=True)
     task = shopping_task()
+
+    if ltm == "matrix":
+        report = run_ablation_matrix(
+            task,
+            k=k,
+            modes=MATRIX_MODES,
+            store_factory=lambda mode: _store(
+                data_dir,
+                label=mode.replace("/", "-"),
+                retriever=retriever,
+                profile=mode,
+            ),
+            agent_factory=DummyGUIAgent,
+        )
+        print(report.format_table())
+        print()
+        for name, arm in report.reports.items():
+            print(f"--- {name} ---")
+            _print_report(arm, label=name)
+        return report
 
     if ltm == "ablate":
         report = run_ltm_ablation(
@@ -70,6 +107,7 @@ def run_demo(
                 enabled=enabled,
                 label="on" if enabled else "off",
                 retriever=retriever,
+                profile="full" if enabled else "off",
             ),
             agent_factory=DummyGUIAgent,
         )
@@ -81,10 +119,19 @@ def run_demo(
         _print_report(report.ltm_on)
         return report
 
-    enabled = ltm == "on"
-    store = _store(data_dir, enabled=enabled, label=ltm, retriever=retriever)
-    report = PassAtKRunner(store, DummyGUIAgent(), ltm_enabled=enabled).run(task, k=k)
-    _print_report(report)
+    profile = "full" if ltm == "on" else ("off" if ltm == "off" else ltm)
+    enabled = profile not in {"off", "ltm-off"}
+    store = _store(
+        data_dir,
+        enabled=enabled,
+        label=ltm,
+        retriever=retriever,
+        profile=profile,
+    )
+    report = PassAtKRunner(store, DummyGUIAgent(), ltm_enabled=store.enabled).run(
+        task, k=k
+    )
+    _print_report(report, label=ltm)
     return report
 
 
@@ -93,19 +140,31 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mobilegui-ltm-demo",
         description=(
             "Dummy pass@k shopping task: attempt 1 fails, attempt 2 can recover "
-            "when long-term memory is left on (no reset between attempts)."
+            "when long-term memory is left on (no reset between attempts). "
+            "Use --matrix for off / failures-only / shortcuts-only / anchors / full."
         ),
     )
     parser.add_argument(
         "--ltm",
-        choices=("on", "off", "ablate"),
+        choices=_LTM_CHOICES,
         default="ablate",
-        help="Enable LTM, disable it, or run both and print a comparison table.",
+        help=(
+            "Enable LTM, disable it, compare on/off, run one kind profile, "
+            "or run the full ablation matrix."
+        ),
     )
     parser.add_argument(
         "--ablate",
         action="store_true",
         help="Shorthand for --ltm ablate (LTM on/off comparison table).",
+    )
+    parser.add_argument(
+        "--matrix",
+        action="store_true",
+        help=(
+            "Shorthand for --ltm matrix (off, failures-only, shortcuts-only, "
+            "anchors, full)."
+        ),
     )
     parser.add_argument(
         "--k",
@@ -133,7 +192,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.k < 1:
         print("error: --k must be >= 1", file=sys.stderr)
         return 2
-    ltm = "ablate" if args.ablate else args.ltm
+    ltm = args.ltm
+    if args.matrix:
+        ltm = "matrix"
+    elif args.ablate:
+        ltm = "ablate"
     run_demo(ltm=ltm, k=args.k, data_dir=args.data_dir, retriever=args.retriever)
     return 0
 

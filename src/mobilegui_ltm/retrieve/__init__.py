@@ -8,9 +8,11 @@ from mobilegui_ltm.retrieve.embedder import (
     SentenceTransformerEmbedder,
 )
 from mobilegui_ltm.retrieve.keyword import BM25Retriever, KeywordRetriever
+from mobilegui_ltm.retrieve.scoring import DEFAULT_KIND_WEIGHTS, expand_links
 
 __all__ = [
     "BM25Retriever",
+    "DEFAULT_KIND_WEIGHTS",
     "EmbeddingRetriever",
     "Embedder",
     "FakeEmbedder",
@@ -18,4 +20,5 @@ __all__ = [
     "HybridRetriever",
     "KeywordRetriever",
     "SentenceTransformerEmbedder",
+    "expand_links",
 ]

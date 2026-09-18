@@ -39,6 +39,7 @@ class PlannerWorkerAdapter:
         preferred = (
             MemoryKind.FAILURE_NOTE,
             MemoryKind.SUBGOAL_TRACE,
+            MemoryKind.CAUSAL_ANCHOR,
             MemoryKind.SHORTCUT,
             MemoryKind.UI_FACT,
         )
@@ -58,7 +59,12 @@ class PlannerWorkerAdapter:
             task_id=task_id,
             app_ids=app_ids,
             k=self.worker_k * 2,
-            kinds=(MemoryKind.UI_FACT, MemoryKind.SHORTCUT, MemoryKind.FAILURE_NOTE),
+            kinds=(
+                MemoryKind.UI_FACT,
+                MemoryKind.SHORTCUT,
+                MemoryKind.FAILURE_NOTE,
+                MemoryKind.CAUSAL_ANCHOR,
+            ),
         )
         ui_first = [r for r in records if r.kind == MemoryKind.UI_FACT]
         shortcuts = [r for r in records if r.kind == MemoryKind.SHORTCUT]

@@ -44,6 +44,8 @@ def test_encoder_writes_ui_facts_subgoal_and_failure(store):
     contents = " ".join(r.content for r in recs)
     assert "ShopY" in contents
     assert "com.example.shopping" in contents
+    assert MemoryKind.CAUSAL_ANCHOR in kinds
+    assert any(r.logical_key == "ui:sellers" for r in recs)
 
 
 def test_success_emits_subgoal_and_shortcut_not_failure():
@@ -73,3 +75,7 @@ def test_shortcuts_can_be_disabled():
     assert all(r.kind is not MemoryKind.SHORTCUT for r in recs)
     fail_traj, fail_out = _sample_fail()
     assert ShortcutEncoder().encode("t", 1, fail_traj, fail_out, "a") == []
+    no_anchors = TrajectorySummarizer(emit_anchors=False, emit_shortcuts=False).encode(
+        "t", 1, traj, outcome, "a"
+    )
+    assert all(r.kind is not MemoryKind.CAUSAL_ANCHOR for r in no_anchors)

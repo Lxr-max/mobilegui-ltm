@@ -5,12 +5,16 @@ from pydantic import ValidationError
 
 from mobilegui_ltm.schema import (
     AttemptOutcome,
+    AtomicAction,
     MemoryKind,
     MemoryRecord,
     OutcomeStatus,
+    RecordStatus,
+    ShortcutSpec,
     Trajectory,
     coerce_outcome,
     coerce_trajectory,
+    parse_atomic_action,
 )
 
 
@@ -67,3 +71,31 @@ def test_invalid_kind_rejected():
             attempt_k=1,
             agent_id="a",
         )
+
+
+def test_parse_atomic_action_and_shortcut_spec():
+    action = parse_atomic_action("apply_filter:size=9")
+    assert action.type == "apply_filter"
+    assert action.args["size"] == "9"
+    assert action.as_text() == "apply_filter:size=9"
+    spec = ShortcutSpec(
+        name="filter_cart",
+        description="size then cart",
+        preconditions=["app=com.shop"],
+        arguments={"size": 9},
+        atomic_actions=[action, AtomicAction(type="tap", target="add_to_cart")],
+        tags=["skill"],
+    )
+    rec = MemoryRecord(
+        kind=MemoryKind.SHORTCUT,
+        content="Shortcut: size then cart",
+        task_id="t",
+        attempt_k=1,
+        agent_id="a",
+        status=RecordStatus.ACTIVE,
+        metadata={"shortcut": spec.model_dump(mode="json")},
+    )
+    parsed = ShortcutSpec.from_record(rec)
+    assert parsed is not None
+    assert parsed.name == "filter_cart"
+    assert parsed.action_texts()[0] == "apply_filter:size=9"

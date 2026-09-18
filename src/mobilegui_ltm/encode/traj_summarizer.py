@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from mobilegui_ltm.encode.anchors import CausalAnchorEncoder
 from mobilegui_ltm.encode.shortcuts import ShortcutEncoder
 from mobilegui_ltm.encode.text import as_text, collect_app_ids, string_list, traj_text
 from mobilegui_ltm.schema import (
@@ -23,7 +24,7 @@ from mobilegui_ltm.schema import (
     Trajectory,
 )
 
-__all__ = ["ShortcutEncoder", "TrajectorySummarizer"]
+__all__ = ["CausalAnchorEncoder", "ShortcutEncoder", "TrajectorySummarizer"]
 
 _SHOP = re.compile(r"\bShop[A-Za-z0-9]+\b")
 _SIZE = re.compile(r"\bsize\s*[=:]?\s*(\d+)\b", re.I)
@@ -33,9 +34,11 @@ _FILTER = re.compile(r"\bfilter(?:ed|s)?\s*[:=]?\s*([A-Za-z0-9_ \-]{1,40})", re.
 class TrajectorySummarizer:
     """Default encoder: structured JSON memories (optional hashing embeddings later)."""
 
-    def __init__(self, *, emit_shortcuts: bool = True) -> None:
+    def __init__(self, *, emit_shortcuts: bool = True, emit_anchors: bool = True) -> None:
         self.emit_shortcuts = emit_shortcuts
+        self.emit_anchors = emit_anchors
         self._shortcut_encoder = ShortcutEncoder()
+        self._anchor_encoder = CausalAnchorEncoder()
 
     def encode(
         self,
@@ -54,10 +57,8 @@ class TrajectorySummarizer:
         )
         records: list[MemoryRecord] = []
 
-        for fact in string_list(traj.metadata.get("ui_facts")):
-            records.append(
-                MemoryRecord(kind=MemoryKind.UI_FACT, content=fact, tags=["explicit"], **common)
-            )
+        for fact in traj.metadata.get("ui_facts") or []:
+            records.append(self._explicit_ui_fact(fact, common))
         records.extend(self._heuristic_ui_facts(traj, outcome, common))
 
         for subgoal in string_list(traj.metadata.get("subgoals") or traj.metadata.get("subgoal_traces")):
@@ -66,6 +67,8 @@ class TrajectorySummarizer:
                     kind=MemoryKind.SUBGOAL_TRACE,
                     content=subgoal,
                     tags=["explicit"],
+                    logical_key=f"{task_id}::subgoal:named:{subgoal[:40]}",
+                    screen=traj.steps[-1].screen if traj.steps else None,
                     **common,
                 )
             )
@@ -97,8 +100,34 @@ class TrajectorySummarizer:
             records.extend(
                 self._shortcut_encoder.encode(task_id, attempt_k, traj, outcome, agent_id)
             )
+        if self.emit_anchors:
+            records.extend(
+                self._anchor_encoder.encode(task_id, attempt_k, traj, outcome, agent_id)
+            )
 
         return [r for r in records if r.content and r.content.strip()]
+
+    def _explicit_ui_fact(self, fact: Any, common: dict[str, Any]) -> MemoryRecord:
+        if isinstance(fact, dict):
+            content = str(fact.get("content") or fact.get("value") or fact.get("text") or "")
+            key = fact.get("key") or f"ui:explicit:{content[:32]}"
+            screen = fact.get("screen")
+            return MemoryRecord(
+                kind=MemoryKind.UI_FACT,
+                content=content,
+                tags=["explicit"],
+                logical_key=str(key),
+                screen=screen,
+                **common,
+            )
+        text = str(fact)
+        return MemoryRecord(
+            kind=MemoryKind.UI_FACT,
+            content=text,
+            tags=["explicit"],
+            logical_key=f"ui:explicit:{text[:40]}",
+            **common,
+        )
 
     def _heuristic_ui_facts(
         self,
@@ -108,12 +137,15 @@ class TrajectorySummarizer:
     ) -> list[MemoryRecord]:
         blob = f"{traj_text(traj)} {outcome.reason or ''}"
         facts: list[MemoryRecord] = []
+        last_screen = traj.steps[-1].screen if traj.steps else None
         if common["app_ids"]:
             facts.append(
                 MemoryRecord(
                     kind=MemoryKind.UI_FACT,
                     content=f"Apps visited: {', '.join(common['app_ids'])}",
                     tags=["apps"],
+                    logical_key="ui:apps",
+                    screen=last_screen,
                     **common,
                 )
             )
@@ -124,6 +156,8 @@ class TrajectorySummarizer:
                     kind=MemoryKind.UI_FACT,
                     content=f"Sellers / shop entities observed: {', '.join(shops)}",
                     tags=["entity", "shop"],
+                    logical_key="ui:sellers",
+                    screen=last_screen,
                     **common,
                 )
             )
@@ -134,6 +168,8 @@ class TrajectorySummarizer:
                     kind=MemoryKind.UI_FACT,
                     content=f"Size values mentioned: {', '.join(sizes)}",
                     tags=["filter", "size"],
+                    logical_key="ui:size",
+                    screen=last_screen,
                     **common,
                 )
             )
@@ -144,6 +180,8 @@ class TrajectorySummarizer:
                     kind=MemoryKind.UI_FACT,
                     content=f"Filters mentioned: {', '.join(filters)}",
                     tags=["filter"],
+                    logical_key="ui:filters",
+                    screen=last_screen,
                     **common,
                 )
             )
@@ -154,6 +192,8 @@ class TrajectorySummarizer:
                     kind=MemoryKind.UI_FACT,
                     content=f"Screens traversed: {' -> '.join(screens)}",
                     tags=["screen"],
+                    logical_key="ui:screens",
+                    screen=screens[-1],
                     **common,
                 )
             )
@@ -183,6 +223,8 @@ class TrajectorySummarizer:
             kind=MemoryKind.SUBGOAL_TRACE,
             content=content,
             tags=["progress", status],
+            logical_key=f"{common['task_id']}::subgoal:progress",
+            screen=last.screen if last else None,
             **common,
         )
 

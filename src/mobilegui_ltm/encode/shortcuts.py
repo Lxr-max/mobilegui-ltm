@@ -1,10 +1,8 @@
-"""Shortcut encoder: reusable GUI action snippets from successful attempts.
+"""Shortcut encoder: executable GUI action snippets from successful attempts.
 
-Inspired by skill / shortcut memories used by multi-agent mobile GUI systems:
-after a success (or a clean high-progress partial), persist the action sequence
-so a later attempt can reuse it. This stays SDK-side — no planner/worker of our
-own — and writes ``MemoryKind.SHORTCUT`` records into the same store as UI facts
-and failure notes.
+Skill-style shortcuts (name, preconditions, arguments, atomic_actions) stay
+SDK-side — no planner/worker of our own. Older text-only ``metadata['actions']``
+lists are still written for dual-read.
 """
 
 from __future__ import annotations
@@ -20,11 +18,14 @@ from mobilegui_ltm.encode.text import (
 )
 from mobilegui_ltm.schema import (
     AttemptOutcome,
+    AtomicAction,
     MemoryKind,
     MemoryRecord,
     OutcomeStatus,
+    ShortcutSpec,
     Trajectory,
     TrajectoryStep,
+    parse_atomic_action,
 )
 
 _SKILL = re.compile(
@@ -41,6 +42,7 @@ _DONE_SCREENS = {
     "paid",
     "finish",
 }
+_SLUG = re.compile(r"[^a-z0-9]+")
 
 
 def _subgoal_label(traj: Trajectory, outcome: AttemptOutcome) -> str | None:
@@ -74,28 +76,50 @@ def _preconditions(traj: Trajectory) -> list[str]:
     return pre
 
 
-def _actions(steps: list[TrajectoryStep]) -> list[str]:
-    out: list[str] = []
+def _atomic_actions(steps: list[TrajectoryStep]) -> list[AtomicAction]:
+    out: list[AtomicAction] = []
     for step in steps:
-        text = action_text(step)
-        if text:
-            out.append(text)
-    return out
+        if step.action is None and not action_text(step):
+            continue
+        out.append(parse_atomic_action(step.action, app_id=step.app_id, screen=step.screen))
+    return [item for item in out if item.type and item.type != "unknown"]
 
 
 def _screens(steps: list[TrajectoryStep]) -> list[str]:
     return [step.screen for step in steps if step.screen]
 
 
-def _summary(actions: list[str], screens: list[str], subgoal: str | None) -> str:
+def _slug(text: str) -> str:
+    slug = _SLUG.sub("_", text.lower()).strip("_")
+    return slug[:40] or "shortcut"
+
+
+def _name(subgoal: str | None, actions: list[AtomicAction], kind: str) -> str:
     if subgoal:
-        head = subgoal
-    elif screens:
-        head = " -> ".join(dict.fromkeys(screens))
-    elif actions:
-        head = " -> ".join(actions[:6])
-    else:
-        head = "successful GUI snippet"
+        return _slug(subgoal)
+    if actions:
+        return _slug(actions[0].as_text())
+    return _slug(kind)
+
+
+def _arguments(actions: list[AtomicAction], preconditions: list[str]) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    for action in actions:
+        for key, value in action.args.items():
+            args.setdefault(key, value)
+        if action.type.lower() in {"tap", "click"} and action.target:
+            if "shop" in action.target.lower() and "seller" not in args:
+                args["seller"] = action.target
+    for pre in preconditions:
+        if pre.startswith("app=") and "app" not in args:
+            args["app"] = pre.split("=", 1)[1]
+        if pre.startswith("start_screen=") and "screen" not in args:
+            args["screen"] = pre.split("=", 1)[1]
+    return args
+
+
+def _summary(spec: ShortcutSpec) -> str:
+    head = spec.description or spec.subgoal or spec.name
     return f"Shortcut: {head}"
 
 
@@ -130,40 +154,78 @@ def _explicit_items(traj: Trajectory) -> list[dict[str, Any]]:
     return items
 
 
-def _record(
+def _spec_to_record(
+    spec: ShortcutSpec,
     *,
-    summary: str,
-    actions: list[str],
-    screens: list[str],
-    preconditions: list[str],
-    subgoal: str | None,
+    quality: str,
     tags: list[str],
     common: dict[str, Any],
+    screen: str | None,
 ) -> MemoryRecord:
-    content_lines = [summary]
-    if actions:
-        content_lines.append("Actions: " + " -> ".join(actions))
-    if preconditions:
-        content_lines.append("Preconditions: " + "; ".join(preconditions))
-    if subgoal:
-        content_lines.append(f"Subgoal: {subgoal}")
+    content_lines = [_summary(spec)]
+    if spec.description and spec.description not in content_lines[0]:
+        content_lines.append(spec.description)
+    texts = spec.action_texts()
+    if texts:
+        content_lines.append("Actions: " + " -> ".join(texts))
+    if spec.preconditions:
+        content_lines.append("Preconditions: " + "; ".join(spec.preconditions))
+    if spec.subgoal:
+        content_lines.append(f"Subgoal: {spec.subgoal}")
+    if spec.arguments:
+        content_lines.append(
+            "Arguments: " + ", ".join(f"{k}={v}" for k, v in spec.arguments.items())
+        )
     tag_list = list(dict.fromkeys([t for t in tags if t]))
+    metadata = {
+        "shortcut": spec.model_dump(mode="json"),
+        "name": spec.name,
+        "description": spec.description,
+        "actions": texts,  # dual-read for older inject/tests
+        "atomic_actions": [step.model_dump(mode="json") for step in spec.atomic_actions],
+        "preconditions": spec.preconditions,
+        "arguments": spec.arguments,
+        "subgoal": spec.subgoal,
+        "screens": [step.screen for step in spec.atomic_actions if step.screen],
+    }
     return MemoryRecord(
         kind=MemoryKind.SHORTCUT,
         content="\n".join(content_lines),
         tags=tag_list,
-        metadata={
-            "actions": actions,
-            "screens": screens,
-            "preconditions": preconditions,
-            "subgoal": subgoal,
-        },
+        logical_key=f"shortcut:{spec.name}",
+        screen=screen,
+        metadata=metadata,
         **common,
     )
 
 
+def _spec_from_steps(
+    steps: list[TrajectoryStep],
+    *,
+    name: str,
+    description: str,
+    preconditions: list[str],
+    subgoal: str | None,
+    app_ids: list[str],
+    extra_tags: list[str],
+) -> ShortcutSpec | None:
+    atomic = _atomic_actions(steps)
+    if not atomic:
+        return None
+    return ShortcutSpec(
+        name=name,
+        description=description,
+        preconditions=preconditions,
+        arguments=_arguments(atomic, preconditions),
+        atomic_actions=atomic,
+        tags=extra_tags,
+        app_ids=app_ids,
+        subgoal=subgoal,
+    )
+
+
 class ShortcutEncoder:
-    """Mine reusable action snippets from successful (or clean partial) trajectories."""
+    """Mine executable action snippets from successful (or clean partial) trajectories."""
 
     def __init__(self, *, max_skill_snippets: int = 3, min_actions: int = 1) -> None:
         self.max_skill_snippets = max_skill_snippets
@@ -191,51 +253,70 @@ class ShortcutEncoder:
         )
         quality = "success" if outcome.status is OutcomeStatus.SUCCESS else "partial"
         records: list[MemoryRecord] = []
+        start_screen = traj.steps[0].screen if traj.steps else None
 
         for item in _explicit_items(traj):
-            actions = string_list(item.get("actions"))
-            screens = string_list(item.get("screens"))
-            pre = string_list(item.get("preconditions")) or list(preconditions)
-            summary_raw = item.get("summary") or item.get("content") or item.get("text")
-            summary = (
-                str(summary_raw)
-                if summary_raw
-                else _summary(actions, screens, item.get("subgoal") or subgoal)
-            )
-            if not summary.lower().startswith("shortcut"):
-                summary = f"Shortcut: {summary}"
-            records.append(
-                _record(
-                    summary=summary,
-                    actions=actions,
-                    screens=screens,
-                    preconditions=pre,
+            if item.get("atomic_actions") or item.get("name"):
+                spec = ShortcutSpec.model_validate(
+                    {
+                        "name": item.get("name") or _slug(str(item.get("summary") or "explicit")),
+                        "description": item.get("description") or item.get("summary") or "",
+                        "preconditions": string_list(item.get("preconditions")) or list(preconditions),
+                        "arguments": item.get("arguments") or {},
+                        "atomic_actions": item.get("atomic_actions")
+                        or [parse_atomic_action(a).model_dump() for a in string_list(item.get("actions"))],
+                        "tags": string_list(item.get("tags")),
+                        "app_ids": app_ids,
+                        "subgoal": item.get("subgoal") or subgoal,
+                    }
+                )
+            else:
+                atomic = [parse_atomic_action(a) for a in string_list(item.get("actions"))]
+                summary = str(item.get("summary") or item.get("content") or item.get("text") or "explicit")
+                spec = ShortcutSpec(
+                    name=_slug(summary),
+                    description=summary,
+                    preconditions=string_list(item.get("preconditions")) or list(preconditions),
+                    arguments=dict(item.get("arguments") or {}),
+                    atomic_actions=atomic,
+                    tags=["explicit"],
+                    app_ids=app_ids,
                     subgoal=item.get("subgoal") or subgoal,
-                    tags=["shortcut", "explicit", quality, task_id]
-                    + app_ids
-                    + ([subgoal] if subgoal else []),
+                )
+            records.append(
+                _spec_to_record(
+                    spec,
+                    quality=quality,
+                    tags=["shortcut", "explicit", quality, task_id] + app_ids,
                     common=common,
+                    screen=start_screen,
                 )
             )
 
-        actions = _actions(traj.steps)
-        screens = _screens(traj.steps)
-        if len(actions) >= self.min_actions:
+        episode = _spec_from_steps(
+            traj.steps,
+            name=_name(subgoal, _atomic_actions(traj.steps), "episode"),
+            description=subgoal or "successful GUI snippet",
+            preconditions=preconditions,
+            subgoal=subgoal,
+            app_ids=app_ids,
+            extra_tags=["episode", quality],
+        )
+        if episode and len(episode.atomic_actions) >= self.min_actions:
             records.append(
-                _record(
-                    summary=_summary(actions, screens, subgoal),
-                    actions=actions,
-                    screens=screens,
-                    preconditions=preconditions,
-                    subgoal=subgoal,
+                _spec_to_record(
+                    episode,
+                    quality=quality,
                     tags=["shortcut", "episode", quality, task_id]
                     + app_ids
                     + ([subgoal] if subgoal else []),
                     common=common,
+                    screen=start_screen,
                 )
             )
 
         skill_added = 0
+        full_texts = episode.action_texts() if episode else []
         for index, step in enumerate(traj.steps):
             if skill_added >= self.max_skill_snippets:
                 break
@@ -244,32 +325,36 @@ class ShortcutEncoder:
                 continue
             start = max(0, index - 2)
             window = traj.steps[start : index + 1]
-            window_actions = _actions(window)
-            if len(window_actions) < 2:
-                continue
-            if actions and window_actions == actions:
-                continue
-            window_screens = _screens(window)
             skill_subgoal = step.screen or act
+            skill = _spec_from_steps(
+                window,
+                name=_name(skill_subgoal, _atomic_actions(window), "skill"),
+                description=f"skill:{skill_subgoal}",
+                preconditions=_preconditions(Trajectory(steps=window, app_ids=app_ids)),
+                subgoal=skill_subgoal,
+                app_ids=app_ids,
+                extra_tags=["skill", quality],
+            )
+            if skill is None or len(skill.atomic_actions) < 2:
+                continue
+            if skill.action_texts() == full_texts:
+                continue
             records.append(
-                _record(
-                    summary=_summary(window_actions, window_screens, skill_subgoal),
-                    actions=window_actions,
-                    screens=window_screens,
-                    preconditions=_preconditions(Trajectory(steps=window, app_ids=app_ids)),
-                    subgoal=skill_subgoal,
-                    tags=["shortcut", "skill", quality, skill_subgoal]
-                    + app_ids,
+                _spec_to_record(
+                    skill,
+                    quality=quality,
+                    tags=["shortcut", "skill", quality, skill_subgoal] + app_ids,
                     common=common,
+                    screen=window[0].screen if window else step.screen,
                 )
             )
             skill_added += 1
 
-        # Drop empty content and exact duplicate action sequences.
         seen: set[tuple[str, ...]] = set()
         unique: list[MemoryRecord] = []
         for record in records:
-            key = tuple(record.metadata.get("actions") or [record.content])
+            spec = ShortcutSpec.from_record(record)
+            key = tuple(spec.action_texts() if spec else [record.content])
             if key in seen:
                 continue
             seen.add(key)
