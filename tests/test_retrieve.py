@@ -33,7 +33,7 @@ def test_retrieve_disabled_store_is_empty(tmp_path):
     assert store.retrieve("x") == []
 
 
-def test_embedding_stub_cosine_and_fallback():
+def test_embedding_retriever_callable_and_cosine():
     assert cosine([1.0, 0.0], [1.0, 0.0]) == 1.0
     recs = [
         MemoryRecord(
@@ -57,7 +57,7 @@ def test_embedding_stub_cosine_and_fallback():
     ranked = retriever.retrieve(recs, "alpha", k=2)
     assert ranked[0].content == "alpha"
 
-    fallback = EmbeddingRetriever(embed_query=None)
+    fallback = EmbeddingRetriever(embed_query=lambda q: [0.0, 1.0], lexical_weight=1.0, vector_weight=0.0)
     text_ranked = fallback.retrieve(recs, "beta", k=1)
     assert text_ranked[0].content == "beta"
 

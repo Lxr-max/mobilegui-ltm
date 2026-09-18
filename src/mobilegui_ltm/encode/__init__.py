@@ -1,5 +1,6 @@
-"""Trajectory encoders. MVP: heuristic summarizer. Shortcuts are phase 2."""
+"""Trajectory encoders: summarizer + first-class shortcut miner."""
 
-from mobilegui_ltm.encode.traj_summarizer import ShortcutEncoder, TrajectorySummarizer
+from mobilegui_ltm.encode.shortcuts import ShortcutEncoder
+from mobilegui_ltm.encode.traj_summarizer import TrajectorySummarizer
 
 __all__ = ["ShortcutEncoder", "TrajectorySummarizer"]

@@ -58,6 +58,8 @@ class JsonFileBackend:
         if agent_id is None:
             records: list[MemoryRecord] = []
             for path in sorted(self.root.glob("*.json")):
+                if path.name.endswith(".vectors.json"):
+                    continue
                 records.extend(self._read_path(path))
         else:
             records = self._read(agent_id)
@@ -80,12 +82,17 @@ class JsonFileBackend:
         if agent_id is None:
             removed = 0
             for path in list(self.root.glob("*.json")):
+                if path.name.endswith(".vectors.json"):
+                    path.unlink(missing_ok=True)
+                    continue
                 removed += len(self._read_path(path))
                 path.unlink(missing_ok=True)
             return removed
         records = self._read(agent_id)
         path = self.path_for(agent_id)
         path.unlink(missing_ok=True)
+        sidecar = self.root / f"{sanitize_agent_id(agent_id)}.vectors.json"
+        sidecar.unlink(missing_ok=True)
         return len(records)
 
     def replace_all(self, records: Sequence[MemoryRecord]) -> None:

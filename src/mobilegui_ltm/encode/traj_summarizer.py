@@ -1,82 +1,39 @@
-"""Heuristic trajectory → UI facts / subgoal traces / failure notes.
+"""Heuristic trajectory → UI facts / subgoal traces / failure notes / shortcuts.
 
 No LLM is required. Structured hints in ``Trajectory.metadata`` and
 ``AttemptOutcome.reason`` are copied through; remaining text is mined for
 app ids, seller-like names, filters, and last-screen progress.
 
-Shortcuts (reusable action snippets) are a phase-2 extension and are not
-emitted by the default encoder.
+Shortcuts are first-class: successful (and clean partial) attempts emit
+reusable action snippets via :class:`ShortcutEncoder`.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable
+from typing import Any
 
+from mobilegui_ltm.encode.shortcuts import ShortcutEncoder
+from mobilegui_ltm.encode.text import as_text, collect_app_ids, string_list, traj_text
 from mobilegui_ltm.schema import (
     AttemptOutcome,
     MemoryKind,
     MemoryRecord,
     OutcomeStatus,
     Trajectory,
-    TrajectoryStep,
 )
+
+__all__ = ["ShortcutEncoder", "TrajectorySummarizer"]
 
 _SHOP = re.compile(r"\bShop[A-Za-z0-9]+\b")
 _SIZE = re.compile(r"\bsize\s*[=:]?\s*(\d+)\b", re.I)
 _FILTER = re.compile(r"\bfilter(?:ed|s)?\s*[:=]?\s*([A-Za-z0-9_ \-]{1,40})", re.I)
 
 
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        parts = []
-        for key, item in value.items():
-            parts.append(f"{key}: {_as_text(item)}")
-        return " ".join(parts)
-    if isinstance(value, (list, tuple)):
-        return " ".join(_as_text(item) for item in value)
-    return str(value)
-
-
-def _step_text(step: TrajectoryStep) -> str:
-    return " ".join(
-        part
-        for part in (
-            _as_text(step.observation),
-            _as_text(step.action),
-            step.app_id or "",
-            step.screen or "",
-            _as_text(step.extras),
-        )
-        if part
-    )
-
-
-def _traj_text(traj: Trajectory) -> str:
-    chunks = [_as_text(traj.metadata)]
-    for step in traj.steps:
-        chunks.append(_step_text(step))
-    return " ".join(chunks)
-
-
-def _string_list(value: Any) -> list[str]:
-    if not value:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Iterable):
-        return [str(item) for item in value if str(item).strip()]
-    return [str(value)]
-
-
 class TrajectorySummarizer:
-    """Default encoder: structured JSON memories, no embeddings, no graph."""
+    """Default encoder: structured JSON memories (optional hashing embeddings later)."""
 
-    def __init__(self, *, emit_shortcuts: bool = False) -> None:
+    def __init__(self, *, emit_shortcuts: bool = True) -> None:
         self.emit_shortcuts = emit_shortcuts
         self._shortcut_encoder = ShortcutEncoder()
 
@@ -88,14 +45,7 @@ class TrajectorySummarizer:
         outcome: AttemptOutcome,
         agent_id: str,
     ) -> list[MemoryRecord]:
-        app_ids = list(traj.app_ids)
-        for step in traj.steps:
-            if step.app_id and step.app_id not in app_ids:
-                app_ids.append(step.app_id)
-        for extra in _string_list(traj.metadata.get("app_ids") or traj.metadata.get("apps")):
-            if extra not in app_ids:
-                app_ids.append(extra)
-
+        app_ids = collect_app_ids(traj)
         common = dict(
             task_id=task_id,
             attempt_k=attempt_k,
@@ -104,13 +54,13 @@ class TrajectorySummarizer:
         )
         records: list[MemoryRecord] = []
 
-        for fact in _string_list(traj.metadata.get("ui_facts")):
+        for fact in string_list(traj.metadata.get("ui_facts")):
             records.append(
                 MemoryRecord(kind=MemoryKind.UI_FACT, content=fact, tags=["explicit"], **common)
             )
         records.extend(self._heuristic_ui_facts(traj, outcome, common))
 
-        for subgoal in _string_list(traj.metadata.get("subgoals") or traj.metadata.get("subgoal_traces")):
+        for subgoal in string_list(traj.metadata.get("subgoals") or traj.metadata.get("subgoal_traces")):
             records.append(
                 MemoryRecord(
                     kind=MemoryKind.SUBGOAL_TRACE,
@@ -121,7 +71,7 @@ class TrajectorySummarizer:
             )
         records.append(self._subgoal_from_progress(traj, outcome, common))
 
-        for note in _string_list(traj.metadata.get("failure_notes")):
+        for note in string_list(traj.metadata.get("failure_notes")):
             records.append(
                 MemoryRecord(
                     kind=MemoryKind.FAILURE_NOTE,
@@ -130,7 +80,7 @@ class TrajectorySummarizer:
                     **common,
                 )
             )
-        notes = _string_list(outcome.metadata.get("failure_notes"))
+        notes = string_list(outcome.metadata.get("failure_notes"))
         for note in notes:
             records.append(
                 MemoryRecord(
@@ -156,7 +106,7 @@ class TrajectorySummarizer:
         outcome: AttemptOutcome,
         common: dict[str, Any],
     ) -> list[MemoryRecord]:
-        blob = f"{_traj_text(traj)} {outcome.reason or ''}"
+        blob = f"{traj_text(traj)} {outcome.reason or ''}"
         facts: list[MemoryRecord] = []
         if common["app_ids"]:
             facts.append(
@@ -225,9 +175,9 @@ class TrajectorySummarizer:
         else:
             content = (
                 f"Attempt {common['attempt_k']} ended {status} at screen="
-                f"{last.screen or 'unknown'} after action={_as_text(last.action) or 'unknown'} "
+                f"{last.screen or 'unknown'} after action={as_text(last.action) or 'unknown'} "
                 f"({len(traj.steps)} steps). "
-                f"Last observation: {_as_text(last.observation)[:240]}"
+                f"Last observation: {as_text(last.observation)[:240]}"
             )
         return MemoryRecord(
             kind=MemoryKind.SUBGOAL_TRACE,
@@ -253,8 +203,8 @@ class TrajectorySummarizer:
                 )
             )
         last = traj.steps[-1] if traj.steps else None
-        last_action = _as_text(last.action) if last else ""
-        last_obs = _as_text(last.observation) if last else ""
+        last_action = as_text(last.action) if last else ""
+        last_obs = as_text(last.observation) if last else ""
         blob = f"{outcome.reason or ''} {last_obs} {last_action}"
         shops = list(dict.fromkeys(_SHOP.findall(blob)))
         if shops:
@@ -308,20 +258,3 @@ class TrajectorySummarizer:
                 )
             )
         return notes
-
-
-class ShortcutEncoder:
-    """Phase-2 stub: reusable GUI action snippets.
-
-    Returns no records in the MVP. Wire this in when a snippet miner exists.
-    """
-
-    def encode(
-        self,
-        task_id: str,
-        attempt_k: int,
-        traj: Trajectory,
-        outcome: AttemptOutcome,
-        agent_id: str,
-    ) -> list[MemoryRecord]:
-        return []

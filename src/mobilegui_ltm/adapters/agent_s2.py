@@ -39,6 +39,7 @@ class PlannerWorkerAdapter:
         preferred = (
             MemoryKind.FAILURE_NOTE,
             MemoryKind.SUBGOAL_TRACE,
+            MemoryKind.SHORTCUT,
             MemoryKind.UI_FACT,
         )
         ordered = [r for kind in preferred for r in records if r.kind == kind]
@@ -60,8 +61,9 @@ class PlannerWorkerAdapter:
             kinds=(MemoryKind.UI_FACT, MemoryKind.SHORTCUT, MemoryKind.FAILURE_NOTE),
         )
         ui_first = [r for r in records if r.kind == MemoryKind.UI_FACT]
-        rest = [r for r in records if r not in ui_first]
-        return (ui_first + rest)[: self.worker_k]
+        shortcuts = [r for r in records if r.kind == MemoryKind.SHORTCUT]
+        rest = [r for r in records if r not in ui_first and r not in shortcuts]
+        return (ui_first + shortcuts + rest)[: self.worker_k]
 
     def inject_planner(
         self,

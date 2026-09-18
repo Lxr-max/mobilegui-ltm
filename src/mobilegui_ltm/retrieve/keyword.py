@@ -76,6 +76,21 @@ class BM25Retriever:
             record for _, record in ranked[:k]
         ]
 
+    def scores(
+        self,
+        records: Sequence[MemoryRecord],
+        query: str,
+        *,
+        task_id: str | None = None,
+    ) -> list[float]:
+        """Raw BM25 scores aligned with ``records`` (no app filter)."""
+        if not records:
+            return []
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return [0.0] * len(records)
+        return self._score(records, query_tokens, task_id=task_id)
+
     def _score(
         self,
         records: Sequence[MemoryRecord],

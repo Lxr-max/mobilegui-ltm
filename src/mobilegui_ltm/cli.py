@@ -16,8 +16,19 @@ from mobilegui_ltm.adapters.pass_at_k import (
 from mobilegui_ltm.api import MemoryStore, create_store
 
 
-def _store(data_dir: Path, *, enabled: bool, label: str) -> MemoryStore:
-    return create_store(data_dir / label, agent_id="dummy-shopping", enabled=enabled)
+def _store(
+    data_dir: Path,
+    *,
+    enabled: bool,
+    label: str,
+    retriever: str = "bm25",
+) -> MemoryStore:
+    kwargs: dict = {}
+    if retriever and retriever != "bm25":
+        kwargs["retriever"] = retriever
+    return create_store(
+        data_dir / label, agent_id="dummy-shopping", enabled=enabled, **kwargs
+    )
 
 
 def _print_report(report: PassAtKReport) -> None:
@@ -44,6 +55,7 @@ def run_demo(
     ltm: str = "ablate",
     k: int = 2,
     data_dir: Path | None = None,
+    retriever: str = "bm25",
 ) -> AblationReport | PassAtKReport:
     data_dir = data_dir or (Path.cwd() / "demo_store")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -54,7 +66,10 @@ def run_demo(
             task,
             k=k,
             store_factory=lambda enabled: _store(
-                data_dir, enabled=enabled, label="on" if enabled else "off"
+                data_dir,
+                enabled=enabled,
+                label="on" if enabled else "off",
+                retriever=retriever,
             ),
             agent_factory=DummyGUIAgent,
         )
@@ -67,7 +82,7 @@ def run_demo(
         return report
 
     enabled = ltm == "on"
-    store = _store(data_dir, enabled=enabled, label=ltm)
+    store = _store(data_dir, enabled=enabled, label=ltm, retriever=retriever)
     report = PassAtKRunner(store, DummyGUIAgent(), ltm_enabled=enabled).run(task, k=k)
     _print_report(report)
     return report
@@ -104,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory for JSON memory files (default: ./demo_store).",
     )
+    parser.add_argument(
+        "--retriever",
+        choices=("bm25", "hybrid", "vector"),
+        default="bm25",
+        help="Ranking backend. 'hybrid' uses local hashing vectors (no downloads).",
+    )
     return parser
 
 
@@ -113,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --k must be >= 1", file=sys.stderr)
         return 2
     ltm = "ablate" if args.ablate else args.ltm
-    run_demo(ltm=ltm, k=args.k, data_dir=args.data_dir)
+    run_demo(ltm=ltm, k=args.k, data_dir=args.data_dir, retriever=args.retriever)
     return 0
 
 

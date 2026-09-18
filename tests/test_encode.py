@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from mobilegui_ltm import create_store
 from mobilegui_ltm.encode import ShortcutEncoder, TrajectorySummarizer
 from mobilegui_ltm.schema import (
     AttemptOutcome,
@@ -47,21 +46,30 @@ def test_encoder_writes_ui_facts_subgoal_and_failure(store):
     assert "com.example.shopping" in contents
 
 
-def test_success_does_not_require_failure_notes():
+def test_success_emits_subgoal_and_shortcut_not_failure():
     encoder = TrajectorySummarizer()
     traj = Trajectory(
-        steps=[TrajectoryStep(screen="cart", action="done", observation="ok")],
+        steps=[
+            TrajectoryStep(screen="search", action="type:q", observation="results"),
+            TrajectoryStep(screen="cart", action="tap:add_to_cart", observation="ok"),
+        ],
         app_ids=["com.shop"],
     )
     recs = encoder.encode(
         "t", 2, traj, AttemptOutcome(status=OutcomeStatus.SUCCESS, reason="ok"), "a"
     )
     assert any(r.kind is MemoryKind.SUBGOAL_TRACE for r in recs)
+    assert any(r.kind is MemoryKind.SHORTCUT for r in recs)
     assert all(r.kind is not MemoryKind.FAILURE_NOTE for r in recs)
 
 
-def test_shortcuts_phase2_stub_empty():
-    traj, outcome = _sample_fail()
-    assert ShortcutEncoder().encode("t", 1, traj, outcome, "a") == []
-    recs = TrajectorySummarizer(emit_shortcuts=True).encode("t", 1, traj, outcome, "a")
+def test_shortcuts_can_be_disabled():
+    traj = Trajectory(
+        steps=[TrajectoryStep(screen="cart", action="tap:add_to_cart", observation="ok")],
+        app_ids=["com.shop"],
+    )
+    outcome = AttemptOutcome(status=OutcomeStatus.SUCCESS, reason="ok")
+    recs = TrajectorySummarizer(emit_shortcuts=False).encode("t", 1, traj, outcome, "a")
     assert all(r.kind is not MemoryKind.SHORTCUT for r in recs)
+    fail_traj, fail_out = _sample_fail()
+    assert ShortcutEncoder().encode("t", 1, fail_traj, fail_out, "a") == []
