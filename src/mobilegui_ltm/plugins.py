@@ -1,6 +1,8 @@
 """Plugin protocols: Backend, Encoder, Retriever, Injector (plus optional Embedder).
 
-Swap any of these without forking the agent. See ``docs/design.md``.
+Optional diagnostics plugins (OutcomeProvider, EpisodeReflector) live in
+``mobilegui_ltm.diagnostics``. Swap any of these without forking the agent.
+See ``docs/design.md``.
 """
 
 from __future__ import annotations

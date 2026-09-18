@@ -34,6 +34,38 @@ def test_cli_ablate_flag(tmp_path, capsys):
     assert "recovery_after_failure" in out
 
 
+def test_cli_diagnose(tmp_path, capsys):
+    report = run_demo(ltm="diagnose", k=2, data_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "OnlineDiagnostics" in out
+    assert "helped=" in out
+    assert "promote proposals" in out
+    assert "auditor" in out
+    assert "dry-run" in out
+    assert report.success is True
+    assert main(["--diagnose", "--k", "2", "--data-dir", str(tmp_path / "cli-diag")]) == 0
+
+
+def test_cli_diagnose_apply_flag(tmp_path, capsys):
+    assert (
+        main(
+            [
+                "--ltm",
+                "diagnose",
+                "--apply-diagnostics",
+                "--k",
+                "2",
+                "--data-dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "apply=apply" in out
+    assert "OnlineDiagnostics" in out
+
+
 def test_cli_matrix(tmp_path, capsys):
     report = run_demo(ltm="matrix", k=2, data_dir=tmp_path)
     out = capsys.readouterr().out

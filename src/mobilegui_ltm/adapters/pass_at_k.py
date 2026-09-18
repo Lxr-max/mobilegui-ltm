@@ -44,6 +44,7 @@ class AttemptResult:
     memories_written: list[MemoryRecord] = field(default_factory=list)
     injected_prompt: Any = None
     ltm_applied: bool = False
+    diagnostics: Any = None
 
 
 @dataclass
@@ -178,12 +179,14 @@ class PassAtKRunner:
         if k < 1:
             raise ValueError("k must be >= 1")
         report = PassAtKReport(task_id=task.task_id, k=k, ltm_enabled=self.ltm_enabled)
+        previous_outcome: AttemptOutcome | None = None
         for attempt_k in range(1, k + 1):
             memories: list[MemoryRecord] = []
             prompt: Any = task.instruction
+            query = task.retrieval_query()
             if self.ltm_enabled:
                 memories = self.store.retrieve(
-                    task.retrieval_query(),
+                    query,
                     task_id=task.task_id,
                     app_ids=task.app_ids or None,
                     k=self.retrieve_k,
@@ -194,10 +197,17 @@ class PassAtKRunner:
             written: list[MemoryRecord] = []
             if self.ltm_enabled:
                 written = self.store.write_attempt(
-                    task.task_id, attempt_k, traj, outcome
+                    task.task_id,
+                    attempt_k,
+                    traj,
+                    outcome,
+                    memories_retrieved=memories,
+                    query=query,
+                    previous_outcome=previous_outcome,
                 )
             success = outcome.status == OutcomeStatus.SUCCESS
             injected_text = prompt if isinstance(prompt, str) else str(prompt)
+            diag = getattr(self.store, "last_report", None)
             report.attempts.append(
                 AttemptResult(
                     attempt_k=attempt_k,
@@ -207,8 +217,10 @@ class PassAtKRunner:
                     memories_written=list(written),
                     injected_prompt=prompt,
                     ltm_applied=bool(self.ltm_enabled and LTM_START in injected_text),
+                    diagnostics=diag,
                 )
             )
+            previous_outcome = outcome
             if success:
                 break
         return report

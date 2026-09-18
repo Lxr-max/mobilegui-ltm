@@ -22,6 +22,7 @@ remember / update / delete / get                    # mid-episode CRUD
 retrieve(..., block=?, blocks=?)                    # optional named view
 inject(..., block=?) / inject_block(prompt, block, query)
 promote / demote                                    # shortcut/anchor gate
+quarantine / unquarantine                           # metadata flag; retrieve skips
 register_app_prior                                  # LocalRAG catalog (no ADB)
 poison                                              # integrity eval fixture
 format_worker_shortcuts(memories)
@@ -32,9 +33,9 @@ rebuild_index()
 
 `create_store(..., profile=..., kind_weights=..., expand_hops=...,
 local_rag=..., blend_local_rag=..., integrity=..., hmac_key=...,
-promote_after=..., include_candidates=...)` is the factory.
-`enabled=False` makes write/retrieve/inject into no-ops (LTM-off ablation)
-without changing call sites.
+promote_after=..., include_candidates=..., diagnostics=True|OnlineDiagnostics|False)`
+is the factory. `enabled=False` makes write/retrieve/inject into no-ops
+(LTM-off ablation) without changing call sites.
 
 Profiles (`off` / `ltm-off`, `failures-only`, `shortcuts-only`, `anchors`,
 `full` / `on` / `ltm-on`) set write/retrieve kinds and whether 1-hop expand
@@ -76,6 +77,12 @@ Callers swap these without forking an agent:
    Stub (`NullLocalRAG`) or in-memory `CatalogLocalRAG`. No device I/O.
 7. **IntegrityGuard** (optional, default off) — SHA-256 + optional HMAC
    research hooks for poisoning experiments. Not a crypto product.
+8. **OnlineDiagnostics** (optional, default off) — after `write_attempt`,
+   attribute retrieved memories, classify failures, propose promote /
+   demote / quarantine. `apply(dry_run=True)` by default.
+9. **EpisodeReflector / OutcomeProvider** — plugin interfaces only.
+   `NullEpisodeReflector` and `NullOutcomeProvider` are the defaults.
+   No LLM client or API keys on the CI path.
 
 Persistence is **structured JSON**. There is **no graph database**.
 
@@ -184,7 +191,7 @@ store.rebuild_index()
    — no extra runtime dependency; hook points only.
 3. One dummy agent (`adapters/dummy.py`) and one planner/worker reference
    adapter (`adapters/agent_s2.py`) proving pluggability.
-4. README + `mobilegui-ltm-demo --ablate` / `--matrix`.
+4. README + `mobilegui-ltm-demo --ablate` / `--matrix` / `--diagnose`.
 
 ### How to run the ablation matrix
 
@@ -240,7 +247,51 @@ promotable rows (counts are inherited across logical-key supersede). After
 failures, `stable` → `candidate` and `candidate` → `retired`. Explicit
 `promote()` / `demote()` always win. Retrieve: `prefer_stable` score bonus;
 `include_candidates` (default True); retired omitted unless
-`include_retired`.
+`include_retired`. A failure→success **recovery delta** on `write_attempt`
+adds one extra `success_count` increment for retrieved promotable rows
+(so a skill that actually recovered a retry can reach `promote_after`
+sooner).
+
+## OnlineDiagnostics
+
+Optional runtime loop (no LLM):
+
+```
+write_attempt → encode/commit → promotion gate → on_episode_end(trace)
+```
+
+`EpisodeTrace` carries the trajectory, outcome, retrieved rows, and the
+previous attempt's outcome. `OnlineDiagnostics.on_episode_end` returns a
+`DiagnosticReport`:
+
+- **Attribution** (`helped` / `hurt` / `unused`): success + retrieved
+  shortcut aligned with the trajectory → helped; failure after injecting
+  a shortcut → hurt; otherwise unused. Other retrieved kinds may count as
+  helped on success when their content overlaps the episode.
+- **Failure class** (heuristic, no LLM): `state_loss`, `misbinding`,
+  `context_drift`, `unverified_progress`, `interruption`, `unknown`.
+- **Actions**: conservative promote / demote / quarantine proposals.
+- **Reflector**: `EpisodeReflector.reflect` may attach tip/shortcut
+  rewrite proposals. They are **not** applied unless
+  `apply(..., include_reflector=True)`.
+
+`EvalAuditor.scan(store)` looks for polarity contradictions (avoid X vs
+tap X), integrity hash mismatches, and stale candidates (promotable
+candidate with `fail_count >= demote_after` and no successes). Suggestions
+are quarantine, not hard-delete.
+
+**Auto vs human-in-the-loop**
+
+| Step | Automatic? |
+| --- | --- |
+| Score episode, classify, propose actions | yes, when `diagnostics=True` |
+| Apply promote / demote / quarantine | no (dry-run); CLI `--apply-diagnostics` or `apply(dry_run=False)` |
+| Apply reflector rewrites | never unless explicitly requested |
+| Quarantine | metadata `quarantined=true`; retrieve excludes by default |
+
+CLI: `mobilegui-ltm-demo --diagnose --k 2` prints attribution counts,
+promote/demote proposals, and auditor contradictions on the dummy
+shopping task.
 
 ## LocalRAG
 
@@ -274,6 +325,7 @@ embedder.
 
 - Thicker env adapters
 - SQLite / external vector DB backends
+- Optional LLM client implementing `EpisodeReflector` (plugin only)
 
 ## Package
 

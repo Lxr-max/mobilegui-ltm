@@ -6,6 +6,7 @@ This is the SDK surface. It is not an agent and not a generic chat-memory OS.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,6 +39,14 @@ from mobilegui_ltm.retrieve.scoring import (
     apply_stability_filter,
     expand_links,
     normalize_kind_weights,
+)
+from mobilegui_ltm.diagnostics.online import OnlineDiagnostics, resolve_diagnostics, trace_from_write
+from mobilegui_ltm.diagnostics.schema import (
+    QUARANTINE_AT_META,
+    QUARANTINE_META,
+    QUARANTINE_REASON_META,
+    DiagnosticReport,
+    is_quarantined,
 )
 from mobilegui_ltm.schema import (
     PROMOTABLE_KINDS,
@@ -105,6 +114,8 @@ class MemoryStore:
         hmac_key: str | bytes | None = None,
         verify_on_retrieve: bool = True,
         drop_unverified: bool = True,
+        diagnostics: bool | OnlineDiagnostics | None = False,
+        include_quarantined: bool = False,
     ) -> None:
         self.backend = backend
         self.encoder = encoder or TrajectorySummarizer()
@@ -136,6 +147,11 @@ class MemoryStore:
             verify_on_retrieve=verify_on_retrieve,
             drop_unverified=drop_unverified,
         )
+        self.include_quarantined = include_quarantined
+        self._last_retrieve: list[MemoryRecord] = []
+        self._last_query: str = ""
+        self.last_report: DiagnosticReport | None = None
+        self.diagnostics: OnlineDiagnostics | None = resolve_diagnostics(diagnostics, self)
 
     # --- core contract -------------------------------------------------
 
@@ -145,17 +161,54 @@ class MemoryStore:
         attempt_k: int,
         traj: Trajectory | dict[str, Any] | list[Any] | str | None,
         outcome: AttemptOutcome | OutcomeStatus | dict[str, Any] | str | bool | None,
+        *,
+        memories_retrieved: Sequence[MemoryRecord] | None = None,
+        query: str | None = None,
+        previous_outcome: AttemptOutcome | OutcomeStatus | dict[str, Any] | str | bool | None = None,
     ) -> list[MemoryRecord]:
-        """Encode and persist one attempt. Writes both successes and failures."""
+        """Encode and persist one attempt. Writes both successes and failures.
+
+        When ``diagnostics`` is enabled, scores retrieved memories after the
+        write and promotion gate. Proposals are dry-run until ``apply()``.
+        """
         if not self.enabled:
             return []
         trajectory = coerce_trajectory(traj)
         result = coerce_outcome(outcome)
+        prev = (
+            coerce_outcome(previous_outcome) if previous_outcome is not None else None
+        )
+        recovery_delta = (
+            prev is not None
+            and prev.status is OutcomeStatus.FAILURE
+            and result.status is OutcomeStatus.SUCCESS
+        )
+        retrieved = self._resolve_retrieved(memories_retrieved, task_id=task_id)
+        q = self._last_query if query is None else query
         records = self.encoder.encode(
             task_id, attempt_k, trajectory, result, self.agent_id
         )
         written = self._commit(records)
-        self._apply_promotion_gate(result, task_id=task_id, app_ids=trajectory.app_ids)
+        self._apply_promotion_gate(
+            result,
+            task_id=task_id,
+            app_ids=trajectory.app_ids,
+            recovery_delta=recovery_delta,
+            retrieved=retrieved,
+        )
+        if self.diagnostics is not None:
+            trace = trace_from_write(
+                task_id=task_id,
+                attempt_k=attempt_k,
+                agent_id=self.agent_id,
+                traj=trajectory,
+                outcome=result,
+                memories_retrieved=retrieved,
+                memories_written=written,
+                query=q or "",
+                previous_outcome=prev,
+            )
+            self.last_report = self.diagnostics.on_episode_end(trace)
         return written
 
     def remember(
@@ -299,6 +352,7 @@ class MemoryStore:
         include_candidates: bool | None = None,
         prefer_stable: bool | None = None,
         blend_local_rag: bool | None = None,
+        include_quarantined: bool | None = None,
     ) -> list[MemoryRecord]:
         """Return top-k memories for this namespace (never resets across attempts)."""
         if not self.enabled:
@@ -306,6 +360,13 @@ class MemoryStore:
         kind_filter = kinds if kinds is not None else self.retrieve_kinds
         pool = self.backend.list(agent_id=self.agent_id, kinds=kind_filter)
         pool = active_only(self._hydrate_vectors(pool))
+        allow_quarantine = (
+            self.include_quarantined
+            if include_quarantined is None
+            else include_quarantined
+        )
+        if not allow_quarantine:
+            pool = [record for record in pool if not is_quarantined(record)]
         names = normalize_block_names(block, blocks)
         if names:
             pool = filter_blocks(pool, names, registry=self.blocks)
@@ -364,6 +425,8 @@ class MemoryStore:
                     if key not in seen:
                         ranked.append(item)
                         seen.add(key)
+        self._last_retrieve = list(ranked)
+        self._last_query = query
         return ranked
 
     def inject(
@@ -449,6 +512,35 @@ class MemoryStore:
         else:
             new_state = Stability.CANDIDATE
         updated = current.model_copy(update={"stability": new_state})
+        return self._persist_records([updated])[0]
+
+    def quarantine(self, key_or_id: str, *, reason: str = "") -> MemoryRecord | None:
+        """Mark a record quarantined (metadata only; not a hard delete)."""
+        if not self.enabled:
+            return None
+        current = self.get(key_or_id, include_inactive=True)
+        if current is None:
+            return None
+        meta = dict(current.metadata)
+        meta[QUARANTINE_META] = True
+        if reason:
+            meta[QUARANTINE_REASON_META] = reason
+        meta[QUARANTINE_AT_META] = datetime.now(timezone.utc).isoformat()
+        updated = current.model_copy(update={"metadata": meta})
+        return self._persist_records([updated])[0]
+
+    def unquarantine(self, key_or_id: str) -> MemoryRecord | None:
+        """Clear the quarantine flag so retrieve can surface the row again."""
+        if not self.enabled:
+            return None
+        current = self.get(key_or_id, include_inactive=True)
+        if current is None:
+            return None
+        meta = dict(current.metadata)
+        meta[QUARANTINE_META] = False
+        meta.pop(QUARANTINE_REASON_META, None)
+        meta.pop(QUARANTINE_AT_META, None)
+        updated = current.model_copy(update={"metadata": meta})
         return self._persist_records([updated])[0]
 
     def register_app_prior(
@@ -561,6 +653,8 @@ class MemoryStore:
             demote_after=self.demote_after,
             promote_kinds=self.promote_kinds,
             integrity=self.integrity,
+            diagnostics=_copy_diagnostics(self),
+            include_quarantined=self.include_quarantined,
         )
 
     def list_memories(
@@ -701,9 +795,15 @@ class MemoryStore:
         *,
         task_id: str,
         app_ids: Sequence[str] | None = None,
+        recovery_delta: bool = False,
+        retrieved: Sequence[MemoryRecord] | None = None,
     ) -> None:
         if outcome.status not in {OutcomeStatus.SUCCESS, OutcomeStatus.FAILURE}:
             return
+        retrieved_ids = {record.id for record in retrieved or []}
+        retrieved_keys = {
+            record.logical_key for record in retrieved or [] if record.logical_key
+        }
         records = [
             record
             for record in active_only(self.backend.list(agent_id=self.agent_id))
@@ -714,7 +814,13 @@ class MemoryStore:
             if record.task_id and record.task_id != task_id:
                 continue
             if outcome.status is OutcomeStatus.SUCCESS:
-                n = record.success_count + 1
+                extra = 0
+                if recovery_delta and (
+                    record.id in retrieved_ids
+                    or (record.logical_key and record.logical_key in retrieved_keys)
+                ):
+                    extra = 1
+                n = record.success_count + 1 + extra
                 update: dict[str, Any] = {"success_count": n}
                 if n >= self.promote_after:
                     update["stability"] = Stability.STABLE
@@ -731,6 +837,20 @@ class MemoryStore:
             patched.append(record.model_copy(update=update))
         if patched:
             self._persist_records(patched)
+
+    def _resolve_retrieved(
+        self,
+        memories_retrieved: Sequence[MemoryRecord] | None,
+        *,
+        task_id: str,
+    ) -> list[MemoryRecord]:
+        if memories_retrieved is not None:
+            return list(memories_retrieved)
+        return [
+            record
+            for record in self._last_retrieve
+            if not record.task_id or record.task_id == task_id
+        ]
 
     def _persist_records(self, records: Sequence[MemoryRecord]) -> list[MemoryRecord]:
         stamped = list(records)
@@ -864,6 +984,8 @@ def create_store(
     hmac_key: str | bytes | None = None,
     verify_on_retrieve: bool = True,
     drop_unverified: bool = True,
+    diagnostics: bool | OnlineDiagnostics | None = False,
+    include_quarantined: bool = False,
 ) -> MemoryStore:
     """Factory: JSON-file store under ``path`` (default ``./.mobilegui_ltm``).
 
@@ -878,6 +1000,7 @@ def create_store(
         create_store(path, kind_weights={"failure_note": 1.3}, expand_hops=1)
         create_store(path, local_rag=[{"app_id": "com.shop", "name": "Shop"}], blend_local_rag=True)
         create_store(path, integrity=True, hmac_key="dev-secret")
+        create_store(path, diagnostics=True)  # OnlineDiagnostics after each write_attempt
     """
     resolved_profile = resolve_profile(profile)
     if resolved_profile is not None:
@@ -930,6 +1053,8 @@ def create_store(
         hmac_key=hmac_key,
         verify_on_retrieve=verify_on_retrieve,
         drop_unverified=drop_unverified,
+        diagnostics=diagnostics,
+        include_quarantined=include_quarantined,
     )
 
 
@@ -985,6 +1110,19 @@ def _resolve_retriever(
             f"Unknown retriever {retriever!r}. Use 'bm25', 'hybrid', or 'vector'."
         )
     return retriever
+
+
+def _copy_diagnostics(store: MemoryStore) -> OnlineDiagnostics | bool:
+    diag = store.diagnostics
+    if diag is None:
+        return False
+    child = OnlineDiagnostics(
+        outcome_provider=diag.outcome_provider,
+        reflector=diag.reflector,
+        auditor=diag.auditor,
+        auto_audit=diag.auto_audit,
+    )
+    return child
 
 
 def _collapse_logical_keys(records: Sequence[MemoryRecord]) -> list[MemoryRecord]:
